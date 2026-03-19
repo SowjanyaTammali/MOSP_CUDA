@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <sstream>
+#include <cstring>
 #include <cuda_runtime.h>
 
 using namespace std;
@@ -18,26 +19,26 @@ using namespace std;
         }                                                                    \
     } while (0)
 
-// GPU kernel: one thread handles one edge
-__global__ void printEdgesKernel(const int* from_list,
-                                 const int* to_list,
-                                 const int* weight_list,
-                                 int nnz) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (i < nnz) {
-        printf("Edge %d: %d -> %d  weight = %d\n",
-               i,
-               from_list[i] + 1,
-               to_list[i] + 1,
-               weight_list[i]);
+// GPU kernel: one thread handles one node and prints its outgoing edges
+__global__ void printGraphCSRKernel(const int* row_ptr,
+                                    const int* col_ind,
+                                    const int* weights,
+                                    int num_nodes) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (int u = 0; u < num_nodes; u++) {
+            printf("Node %d -> ", u + 1);
+            for (int e = row_ptr[u]; e < row_ptr[u + 1]; e++) {
+                printf("(%d, w=%d) ", col_ind[e] + 1, weights[e]);
+            }
+            printf("\n");
+        }
     }
 }
 
 int main() {
-    // -------------------------------
+    // -----------------------------------------
     // 1. Open the .mtx file on CPU
-    // -------------------------------
+    // -----------------------------------------
     ifstream file("graph.mtx");
     if (!file.is_open()) {
         cout << "Error: Could not open graph.mtx\n";
@@ -46,7 +47,7 @@ int main() {
 
     string line;
 
-    // Skip comment/header lines starting with %
+    // Skip Matrix Market header/comments
     while (getline(file, line)) {
         if (!line.empty() && line[0] != '%') {
             break;
@@ -58,16 +59,13 @@ int main() {
     int rows, cols, nnz;
     ss >> rows >> cols >> nnz;
 
-    // -------------------------------
-    // 2. Store graph edges on CPU
-    // -------------------------------
-    vector<int> from_list;
-    vector<int> to_list;
-    vector<int> weight_list;
-
-    from_list.reserve(nnz);
-    to_list.reserve(nnz);
-    weight_list.reserve(nnz);
+    // -----------------------------------------
+    // 2. Temporary CPU storage for input edges
+    //    (used only to help build CSR)
+    // -----------------------------------------
+    vector<int> from_list(nnz);
+    vector<int> to_list(nnz);
+    vector<int> weight_list(nnz);
 
     for (int i = 0; i < nnz; i++) {
         int r, c, w;
@@ -77,68 +75,88 @@ int main() {
         r--;
         c--;
 
-        from_list.push_back(r);
-        to_list.push_back(c);
-        weight_list.push_back(w);
+        from_list[i] = r;
+        to_list[i] = c;
+        weight_list[i] = w;
     }
 
     file.close();
 
-    // -------------------------------
-    // 3. Print edges on CPU
-    // -------------------------------
-    cout << "Edges stored on CPU:\n";
+    // -----------------------------------------
+    // 3. Allocate CSR arrays using Unified Memory
+    // -----------------------------------------
+    int* row_ptr = nullptr;
+    int* col_ind = nullptr;
+    int* weights = nullptr;
+
+    CUDA_CHECK(cudaMallocManaged(&row_ptr, (rows + 1) * sizeof(int)));
+    CUDA_CHECK(cudaMallocManaged(&col_ind, nnz * sizeof(int)));
+    CUDA_CHECK(cudaMallocManaged(&weights, nnz * sizeof(int)));
+
+    // Initialize row_ptr to zero
+    memset(row_ptr, 0, (rows + 1) * sizeof(int));
+
+    // -----------------------------------------
+    // 4. Build CSR: count outgoing edges
+    // -----------------------------------------
     for (int i = 0; i < nnz; i++) {
-        cout << "Edge " << i << ": "
-             << from_list[i] + 1 << " -> "
-             << to_list[i] + 1
-             << "  weight = " << weight_list[i] << "\n";
+        row_ptr[from_list[i] + 1]++;
     }
 
-    // -------------------------------
-    // 4. Allocate memory on GPU
-    // -------------------------------
-    int* d_from_list = nullptr;
-    int* d_to_list = nullptr;
-    int* d_weight_list = nullptr;
+    // Prefix sum to get row_ptr
+    for (int i = 1; i <= rows; i++) {
+        row_ptr[i] += row_ptr[i - 1];
+    }
 
-    CUDA_CHECK(cudaMalloc((void**)&d_from_list, nnz * sizeof(int)));
-    CUDA_CHECK(cudaMalloc((void**)&d_to_list, nnz * sizeof(int)));
-    CUDA_CHECK(cudaMalloc((void**)&d_weight_list, nnz * sizeof(int)));
+    // Use a temporary CPU vector to track fill positions
+    vector<int> current_pos(rows);
+    for (int i = 0; i < rows; i++) {
+        current_pos[i] = row_ptr[i];
+    }
 
-    // -------------------------------
-    // 5. Copy CPU arrays to GPU
-    // -------------------------------
-    CUDA_CHECK(cudaMemcpy(d_from_list, from_list.data(),
-                          nnz * sizeof(int), cudaMemcpyHostToDevice));
+    // Fill col_ind and weights
+    for (int i = 0; i < nnz; i++) {
+        int u = from_list[i];
+        int pos = current_pos[u]++;
 
-    CUDA_CHECK(cudaMemcpy(d_to_list, to_list.data(),
-                          nnz * sizeof(int), cudaMemcpyHostToDevice));
+        col_ind[pos] = to_list[i];
+        weights[pos] = weight_list[i];
+    }
 
-    CUDA_CHECK(cudaMemcpy(d_weight_list, weight_list.data(),
-                          nnz * sizeof(int), cudaMemcpyHostToDevice));
+    // -----------------------------------------
+    // 5. Print graph on CPU using CSR
+    // -----------------------------------------
+    cout << "Graph printed from CPU using CSR:\n";
+    for (int u = 0; u < rows; u++) {
+        cout << "Node " << u + 1 << " -> ";
+        for (int e = row_ptr[u]; e < row_ptr[u + 1]; e++) {
+            cout << "(" << col_ind[e] + 1 << ", w=" << weights[e] << ") ";
+        }
+        cout << "\n";
+    }
 
-    // -------------------------------
+    // Make sure managed memory is ready before kernel launch
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // -----------------------------------------
     // 6. Launch GPU kernel
-    // -------------------------------
-    cout << "\nEdges printed by GPU:\n";
+    // -----------------------------------------
+    cout << "\nGraph printed from GPU using CSR:\n";
 
-    int threadsPerBlock = 256;
-    int blocksPerGrid = (nnz + threadsPerBlock - 1) / threadsPerBlock;
+    // int threadsPerBlock = 256;
+    // int blocksPerGrid = (rows + threadsPerBlock - 1) / threadsPerBlock;
 
-    printEdgesKernel<<<blocksPerGrid, threadsPerBlock>>>(
-        d_from_list, d_to_list, d_weight_list, nnz
-    );
+  printGraphCSRKernel<<<1, 1>>>(row_ptr, col_ind, weights, rows);
 
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // -------------------------------
-    // 7. Free GPU memory
-    // -------------------------------
-    CUDA_CHECK(cudaFree(d_from_list));
-    CUDA_CHECK(cudaFree(d_to_list));
-    CUDA_CHECK(cudaFree(d_weight_list));
+    // -----------------------------------------
+    // 7. Free Unified Memory
+    // -----------------------------------------
+    CUDA_CHECK(cudaFree(row_ptr));
+    CUDA_CHECK(cudaFree(col_ind));
+    CUDA_CHECK(cudaFree(weights));
 
     return 0;
 }
