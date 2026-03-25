@@ -1,6 +1,0 @@
-bin/
-build/
-output/
-*.o
-*.out
-.DS_Store
