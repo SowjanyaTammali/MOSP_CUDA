@@ -49,4 +49,17 @@ bool recomputeCandidatesOnDevice(const DeviceCsrGraph& incomingGraph,
                                  std::vector<int>& newDistances,
                                  std::vector<int>& newParents);
 
+/**
+ * @brief Detects which candidate vertices changed distance on the GPU.
+ * @param oldDistances Previous distance array on the CPU.
+ * @param newDistances New distance array on the CPU.
+ * @param candidateVertices Candidate vertices to inspect.
+ * @param changedVertices Output changed vertices on the CPU.
+ * @return true if successful, false otherwise.
+ */
+bool detectChangedCandidatesOnDevice(const std::vector<int>& oldDistances,
+                                     const std::vector<int>& newDistances,
+                                     const std::vector<int>& candidateVertices,
+                                     std::vector<int>& changedVertices);
+
 #endif

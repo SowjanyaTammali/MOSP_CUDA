@@ -4,18 +4,21 @@
 #include "../headers/cuda_sosp_update.cuh"
 #include "../headers/updateGraphCSR.h"
 #include "../headers/sequentialSOSPUpdate.h"
+#include "../headers/cudaCombinedGraph.cuh"
+#include "../headers/cudaMOSPWorkflow.cuh"
 
 #include <climits>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
-#include <sstream>
 
 /**
  * @file main.cpp
- * @brief Runs CUDA SOSP, CPU sequential SOSP baseline, and compares results.
+ * @brief Runs CUDA SOSP, CPU sequential SOSP baseline, CUDA incremental update,
+ *        or CUDA combined graph mode.
  */
 
 void printVector(const std::string& name, const std::vector<int>& values) {
@@ -172,17 +175,66 @@ bool loadInitialCandidatesFromChanges(const std::string& insertPath,
     return true;
 }
 
-/**
- * @brief Entry point for CUDA vs sequential SOSP comparison.
- * @return 0 on success, 1 on failure.
- */
 int main(int argc, char* argv[]) {
+    if (argc >= 2 && std::string(argv[1]) == "workflow") {
+        if (argc < 7) {
+            std::cerr << "Usage: " << argv[0]
+                      << " workflow <originalPrefix> <updatedPrefix> <insertFile> <deleteFile> <source>\n";
+            return 1;
+        }
+
+        std::string originalPrefix = argv[2];
+        std::string updatedPrefix = argv[3];
+        std::string insertPath = argv[4];
+        std::string deletePath = argv[5];
+        int source = std::stoi(argv[6]);
+
+        if (!runCudaMOSPWorkflow(originalPrefix, updatedPrefix, insertPath, deletePath, source)) {
+            std::cerr << "Error: runCudaMOSPWorkflow failed.\n";
+            return 1;
+        }
+
+        return 0;
+    }
+
+    if (argc >= 2 && std::string(argv[1]) == "combined") {
+        if (argc < 6) {
+            std::cerr << "Usage: " << argv[0]
+                      << " combined <originalPrefix> <K> <source> <tree1> <tree2> ... <treeK>\n";
+            return 1;
+        }
+
+        std::string originalPrefix = argv[2];
+        int K = std::stoi(argv[3]);
+        int source = std::stoi(argv[4]);
+
+        if (argc < 5 + K) {
+            std::cerr << "Error: not enough tree paths for K.\n";
+            return 1;
+        }
+
+        std::vector<std::string> treeInputPaths;
+        for (int i = 0; i < K; ++i) {
+            treeInputPaths.push_back(argv[5 + i]);
+        }
+
+        if (!cudaCombinedGraph(originalPrefix, treeInputPaths, K, source)) {
+            std::cerr << "Error: cudaCombinedGraph failed.\n";
+            return 1;
+        }
+
+        return 0;
+    }
+
     if (argc < 7) {
         std::cerr << "Usage: " << argv[0]
                   << " <originalPrefix> <updatedPrefix> <insertFile> <deleteFile> <objectiveIndex> <sourceVertex>\n";
+        std::cerr << "Or:    " << argv[0]
+                  << " combined <originalPrefix> <K> <source> <tree1> ... <treeK>\n";
+        std::cerr << "Or:    " << argv[0]
+                  << " workflow <originalPrefix> <updatedPrefix> <insertFile> <deleteFile> <source>\n";
         return 1;
     }
-
     std::string originalPrefix = argv[1];
     std::string updatedPrefix  = argv[2];
     std::string insertPath     = argv[3];
@@ -300,19 +352,19 @@ int main(int argc, char* argv[]) {
     std::vector<int> updatedParents;
 
     if (!runHybridIncrementalSOSPUpdate(updatedOutgoingCSR,
-        updatedIncomingCSR,
-        deviceUpdatedIncomingCSR,
-        originalDistances,
-        originalParents,
-        initialCandidates,
-        deletePath,
-        sourceVertex,
-        updatedDistances,
-        updatedParents)) {
-std::cerr << "Error: hybrid incremental SOSP update failed on updated graph.\n";
-freeDeviceCsr(deviceUpdatedIncomingCSR);
-return 1;
-}
+                                        updatedIncomingCSR,
+                                        deviceUpdatedIncomingCSR,
+                                        originalDistances,
+                                        originalParents,
+                                        initialCandidates,
+                                        deletePath,
+                                        sourceVertex,
+                                        updatedDistances,
+                                        updatedParents)) {
+        std::cerr << "Error: hybrid incremental SOSP update failed on updated graph.\n";
+        freeDeviceCsr(deviceUpdatedIncomingCSR);
+        return 1;
+    }
 
     printVector("Updated Graph Distances (CUDA Incremental)", updatedDistances);
     printVector("Updated Graph Parents (CUDA Incremental)", updatedParents);

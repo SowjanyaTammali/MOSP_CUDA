@@ -14,19 +14,6 @@
 
 namespace {
 
-std::vector<int> collectChangedVertices(const std::vector<int>& oldDistances,
-                                        const std::vector<int>& newDistances,
-                                        const std::vector<int>& candidates) {
-    std::vector<int> changed;
-    for (int v : candidates) {
-        if (v >= 0 && v < static_cast<int>(oldDistances.size()) &&
-            oldDistances[v] != newDistances[v]) {
-            changed.push_back(v);
-        }
-    }
-    return changed;
-}
-
 std::vector<int> collectNextCandidatesFromOutgoing(const HostCsrGraph& outgoingCSR,
                                                    const std::vector<int>& changedVertices) {
     std::vector<int> nextCandidates;
@@ -185,8 +172,13 @@ bool runHybridSOSPUpdate(const HostCsrGraph& outgoingCSR,
             return false;
         }
 
-        std::vector<int> changedVertices =
-            collectChangedVertices(finalDistances, gpuNewDistances, candidates);
+        std::vector<int> changedVertices;
+        if (!detectChangedCandidatesOnDevice(finalDistances,
+                                             gpuNewDistances,
+                                             candidates,
+                                             changedVertices)) {
+            return false;
+        }
 
         finalDistances = gpuNewDistances;
 
@@ -247,8 +239,13 @@ bool runHybridIncrementalSOSPUpdate(const HostCsrGraph& outgoingCSR,
             return false;
         }
 
-        std::vector<int> changedVertices =
-            collectChangedVertices(finalDistances, gpuNewDistances, candidates);
+        std::vector<int> changedVertices;
+        if (!detectChangedCandidatesOnDevice(finalDistances,
+                                             gpuNewDistances,
+                                             candidates,
+                                             changedVertices)) {
+            return false;
+        }
 
         finalDistances = gpuNewDistances;
 

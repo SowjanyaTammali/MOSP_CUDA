@@ -112,6 +112,21 @@ __global__ void recomputeCandidatesKernel(int candidateCount,
     newParents[v] = bestParent;
 }
 
+__global__ void detectChangedCandidatesKernel(int candidateCount,
+                                              const int* candidateVertices,
+                                              const int* oldDistances,
+                                              const int* newDistances,
+                                              int* changedFlags) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx >= candidateCount) {
+        return;
+    }
+
+    int v = candidateVertices[idx];
+    changedFlags[idx] = (oldDistances[v] != newDistances[v]) ? 1 : 0;
+}
+
 bool computeOutDegreesOnDevice(const DeviceCsrGraph& deviceGraph, std::vector<int>& degrees) {
     degrees.assign(deviceGraph.n, 0);
 
@@ -399,5 +414,133 @@ bool recomputeCandidatesOnDevice(const DeviceCsrGraph& incomingGraph,
     cudaFree(d_newDistances);
     cudaFree(d_newParents);
     cudaFree(d_candidateVertices);
+    return true;
+}
+
+bool detectChangedCandidatesOnDevice(const std::vector<int>& oldDistances,
+                                     const std::vector<int>& newDistances,
+                                     const std::vector<int>& candidateVertices,
+                                     std::vector<int>& changedVertices) {
+    if (oldDistances.size() != newDistances.size()) {
+        return false;
+    }
+
+    changedVertices.clear();
+
+    if (candidateVertices.empty()) {
+        return true;
+    }
+
+    int n = static_cast<int>(oldDistances.size());
+    int candidateCount = static_cast<int>(candidateVertices.size());
+
+    int* d_oldDistances = nullptr;
+    int* d_newDistances = nullptr;
+    int* d_candidateVertices = nullptr;
+    int* d_changedFlags = nullptr;
+    cudaError_t err;
+
+    err = cudaMalloc(reinterpret_cast<void**>(&d_oldDistances), n * sizeof(int));
+    if (err != cudaSuccess) return false;
+
+    err = cudaMalloc(reinterpret_cast<void**>(&d_newDistances), n * sizeof(int));
+    if (err != cudaSuccess) {
+        cudaFree(d_oldDistances);
+        return false;
+    }
+
+    err = cudaMalloc(reinterpret_cast<void**>(&d_candidateVertices), candidateCount * sizeof(int));
+    if (err != cudaSuccess) {
+        cudaFree(d_oldDistances);
+        cudaFree(d_newDistances);
+        return false;
+    }
+
+    err = cudaMalloc(reinterpret_cast<void**>(&d_changedFlags), candidateCount * sizeof(int));
+    if (err != cudaSuccess) {
+        cudaFree(d_oldDistances);
+        cudaFree(d_newDistances);
+        cudaFree(d_candidateVertices);
+        return false;
+    }
+
+    err = cudaMemcpy(d_oldDistances, oldDistances.data(), n * sizeof(int), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(d_oldDistances);
+        cudaFree(d_newDistances);
+        cudaFree(d_candidateVertices);
+        cudaFree(d_changedFlags);
+        return false;
+    }
+
+    err = cudaMemcpy(d_newDistances, newDistances.data(), n * sizeof(int), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(d_oldDistances);
+        cudaFree(d_newDistances);
+        cudaFree(d_candidateVertices);
+        cudaFree(d_changedFlags);
+        return false;
+    }
+
+    err = cudaMemcpy(d_candidateVertices, candidateVertices.data(),
+                     candidateCount * sizeof(int), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(d_oldDistances);
+        cudaFree(d_newDistances);
+        cudaFree(d_candidateVertices);
+        cudaFree(d_changedFlags);
+        return false;
+    }
+
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (candidateCount + threadsPerBlock - 1) / threadsPerBlock;
+
+    detectChangedCandidatesKernel<<<blocksPerGrid, threadsPerBlock>>>(
+        candidateCount,
+        d_candidateVertices,
+        d_oldDistances,
+        d_newDistances,
+        d_changedFlags
+    );
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        cudaFree(d_oldDistances);
+        cudaFree(d_newDistances);
+        cudaFree(d_candidateVertices);
+        cudaFree(d_changedFlags);
+        return false;
+    }
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        cudaFree(d_oldDistances);
+        cudaFree(d_newDistances);
+        cudaFree(d_candidateVertices);
+        cudaFree(d_changedFlags);
+        return false;
+    }
+
+    std::vector<int> changedFlags(candidateCount, 0);
+    err = cudaMemcpy(changedFlags.data(), d_changedFlags,
+                     candidateCount * sizeof(int), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        cudaFree(d_oldDistances);
+        cudaFree(d_newDistances);
+        cudaFree(d_candidateVertices);
+        cudaFree(d_changedFlags);
+        return false;
+    }
+
+    for (int i = 0; i < candidateCount; ++i) {
+        if (changedFlags[i]) {
+            changedVertices.push_back(candidateVertices[i]);
+        }
+    }
+
+    cudaFree(d_oldDistances);
+    cudaFree(d_newDistances);
+    cudaFree(d_candidateVertices);
+    cudaFree(d_changedFlags);
     return true;
 }
