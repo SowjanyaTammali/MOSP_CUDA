@@ -12,7 +12,7 @@ MAIN_TARGET = bin/mosp_cuda
 STRESS_TARGET = bin/cuda_stress_test
 
 # Main executable objects
-MAIN_CPP_OBJECTS = build/main.o build/read.o build/updateGraphCSR.o build/sequentialSOSPUpdate.o
+MAIN_CPP_OBJECTS = build/main.o build/read.o build/updateGraphCSR.o build/sequentialSOSPUpdate.o build/Dijkstra.o build/generateGraphCSR.o build/generateChangedEdges.o
 MAIN_CU_OBJECTS = build/cuda_graph.o build/cuda_kernels.o build/cuda_sosp_update.o build/cudaCombinedGraph.o build/cudaMOSPWorkflow.o
 MAIN_OBJECTS = $(MAIN_CPP_OBJECTS) $(MAIN_CU_OBJECTS)
 
@@ -33,7 +33,7 @@ $(STRESS_TARGET): $(STRESS_OBJECTS)
 	$(NVCC) $(STRESS_OBJECTS) -o $(STRESS_TARGET) $(LDFLAGS)
 
 # Compile main driver
-build/main.o: src/main.cpp headers/read.h headers/cuda_graph.cuh headers/cuda_sosp_update.cuh headers/updateGraphCSR.h headers/sequentialSOSPUpdate.h headers/cudaCombinedGraph.cuh headers/cudaMOSPWorkflow.cuh
+build/main.o: src/main.cpp headers/read.h headers/cuda_graph.cuh headers/cuda_sosp_update.cuh headers/updateGraphCSR.h headers/sequentialSOSPUpdate.h headers/cudaCombinedGraph.cuh headers/cudaMOSPWorkflow.cuh headers/dijkstra.h headers/generateGraphCSR.h headers/generateChangedEdges.h
 	$(CXX) $(CXXFLAGS) -c src/main.cpp -o build/main.o
 
 # Compile stress test driver
@@ -72,7 +72,7 @@ build/cuda_sosp_update.o: src/cuda_sosp_update.cu headers/cuda_sosp_update.cuh h
 build/cudaCombinedGraph.o: src/cudaCombinedGraph.cu headers/cudaCombinedGraph.cuh headers/read.h headers/cuda_graph.cuh headers/cuda_sosp_update.cuh
 	$(NVCC) $(NVCCFLAGS) -c src/cudaCombinedGraph.cu -o build/cudaCombinedGraph.o
 
-build/cudaMOSPWorkflow.o: src/cudaMOSPWorkflow.cu headers/cudaMOSPWorkflow.cuh headers/read.h headers/cuda_graph.cuh headers/cuda_sosp_update.cuh headers/cudaCombinedGraph.cuh
+build/cudaMOSPWorkflow.o: src/cudaMOSPWorkflow.cu headers/cudaMOSPWorkflow.cuh headers/read.h headers/cuda_graph.cuh headers/cuda_sosp_update.cuh headers/cudaCombinedGraph.cuh headers/updateGraphCSR.h
 	$(NVCC) $(NVCCFLAGS) -c src/cudaMOSPWorkflow.cu -o build/cudaMOSPWorkflow.o
 
 # Clean

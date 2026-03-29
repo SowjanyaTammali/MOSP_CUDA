@@ -6,6 +6,9 @@
 #include "../headers/sequentialSOSPUpdate.h"
 #include "../headers/cudaCombinedGraph.cuh"
 #include "../headers/cudaMOSPWorkflow.cuh"
+#include "../headers/dijkstra.h"
+#include "../headers/generateGraphCSR.h"
+#include "../headers/generateChangedEdges.h"
 
 #include <climits>
 #include <filesystem>
@@ -18,7 +21,7 @@
 /**
  * @file main.cpp
  * @brief Runs CUDA SOSP, CPU sequential SOSP baseline, CUDA incremental update,
- *        or CUDA combined graph mode.
+ *        CUDA combined graph mode, CUDA workflow mode, or a full OpenMP-style pipeline mode.
  */
 
 void printVector(const std::string& name, const std::vector<int>& values) {
@@ -151,6 +154,7 @@ bool loadInitialCandidatesFromChanges(const std::string& insertPath,
             std::istringstream iss(line);
             int u, v;
             if (!(iss >> u >> v)) continue;
+            addVertex(u);
             addVertex(v);
         }
     }
@@ -168,6 +172,7 @@ bool loadInitialCandidatesFromChanges(const std::string& insertPath,
             std::istringstream iss(line);
             int u, v;
             if (!(iss >> u >> v)) continue;
+            addVertex(u);
             addVertex(v);
         }
     }
@@ -176,6 +181,82 @@ bool loadInitialCandidatesFromChanges(const std::string& insertPath,
 }
 
 int main(int argc, char* argv[]) {
+    if (argc >= 2 && std::string(argv[1]) == "full") {
+        if (argc < 9) {
+            std::cerr << "Usage: " << argv[0]
+                      << " full <numNodes> <numEdges> <numObjectives> <objectiveMaxWeight> <numChangedEdges> <insertPct> <source>\n";
+            return 1;
+        }
+
+        int numberOfNodes = std::stoi(argv[2]);
+        int numberOfEdges = std::stoi(argv[3]);
+        int numberOfObjectives = std::stoi(argv[4]);
+        int objectiveMaxWeight = std::stoi(argv[5]);
+        int numberOfChangedEdges = std::stoi(argv[6]);
+        int insertPct = std::stoi(argv[7]);
+        int source = std::stoi(argv[8]);
+
+        int deletePct = 100 - insertPct;
+        unsigned int graphSeed = 12345;
+        unsigned int changeSeed = 54321;
+
+        std::string originalPrefix = "data/originalGraph/graphCsr";
+        std::string updatedPrefix = "data/updatedGraph/updatedGraphCsr";
+        std::string insertPath = "data/changes/insert.txt";
+        std::string deletePath = "data/changes/delete.txt";
+
+        std::string originalDistancesPath = "output/distancesTrees/distancesCsr.txt";
+        std::string originalTreePath = "output/distancesTrees/SSSPTreeCsr.txt";
+        std::string updatedDistancesPath = "output/updatedDistancesTrees/updatedDistancesCsr.txt";
+        std::string updatedTreePath = "output/updatedDistancesTrees/updatedSSSPTreeCsr.txt";
+        std::string baselineDistancesPath = "output/sospUpdateDistancesTrees/distancesCsr.txt";
+        std::string baselineTreePath = "output/sospUpdateDistancesTrees/SSSPTreeCsr.txt";
+
+        bool ok = true;
+
+        ok = ok && generateGraphCSR(numberOfNodes, numberOfEdges, true,
+                                    originalPrefix, numberOfObjectives,
+                                    1, objectiveMaxWeight, graphSeed);
+
+        ok = ok && generateChangedEdges(1, objectiveMaxWeight, numberOfObjectives,
+                                        numberOfNodes, numberOfChangedEdges,
+                                        insertPct, deletePct, true, true, true,
+                                        false, originalPrefix, insertPath,
+                                        deletePath, changeSeed);
+
+        ok = ok && updateGraphCSR(originalPrefix, updatedPrefix, insertPath, deletePath, true);
+
+        ok = ok && runDijkstraCSR(originalPrefix, 0, source,
+                                  originalDistancesPath, originalTreePath);
+
+        ok = ok && runDijkstraCSR(updatedPrefix, 0, source,
+                                  updatedDistancesPath, updatedTreePath);
+
+        ok = ok && sequentialSOSPUpdate(originalPrefix,
+                                        originalDistancesPath,
+                                        originalTreePath,
+                                        insertPath,
+                                        deletePath,
+                                        0,
+                                        source,
+                                        baselineDistancesPath,
+                                        baselineTreePath);
+
+        ok = ok && runCudaMOSPWorkflow(originalPrefix,
+                                       updatedPrefix,
+                                       insertPath,
+                                       deletePath,
+                                       source);
+
+        if (!ok) {
+            std::cerr << "Error: full pipeline failed.\n";
+            return 1;
+        }
+
+        std::cout << "Full pipeline completed successfully.\n";
+        return 0;
+    }
+
     if (argc >= 2 && std::string(argv[1]) == "workflow") {
         if (argc < 7) {
             std::cerr << "Usage: " << argv[0]
@@ -233,8 +314,11 @@ int main(int argc, char* argv[]) {
                   << " combined <originalPrefix> <K> <source> <tree1> ... <treeK>\n";
         std::cerr << "Or:    " << argv[0]
                   << " workflow <originalPrefix> <updatedPrefix> <insertFile> <deleteFile> <source>\n";
+        std::cerr << "Or:    " << argv[0]
+                  << " full <numNodes> <numEdges> <numObjectives> <objectiveMaxWeight> <numChangedEdges> <insertPct> <source>\n";
         return 1;
     }
+
     std::string originalPrefix = argv[1];
     std::string updatedPrefix  = argv[2];
     std::string insertPath     = argv[3];
