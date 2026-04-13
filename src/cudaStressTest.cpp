@@ -1,12 +1,14 @@
 #include "../headers/dijkstra.h"
 #include "../headers/generateChangedEdges.h"
 #include "../headers/generateGraphCSR.h"
-#include "../headers/read.h"
-#include "../headers/cuda_graph.cuh"
-#include "../headers/cuda_sosp_update.cuh"
+#include "../headers/cudaCombinedGraph.cuh"
+#include "../headers/cudaParallelSOSPUpdate.cuh"
 #include "../headers/updateGraphCSR.h"
+#include "../headers/sequentialSOSPUpdate.h"
 
+#include <algorithm>
 #include <climits>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -16,146 +18,59 @@
 
 using namespace std;
 
-/**
- * @file cudaStressTest.cpp
- * @brief Randomized stress test for the hybrid CUDA incremental SOSP update.
- */
-
 namespace {
 
 bool readDistanceFile(const string& path, vector<int>& distances) {
-    ifstream in(path);
-    if (!in.is_open()) return false;
+    ifstream in(path);                                      // open file
+    if (!in.is_open()) return false;                       // fail if missing
 
-    distances.clear();
-    int vertex;
-    string token;
+    distances.clear();                                     // reset output
+    int vertex;                                            // vertex id
+    string token;                                          // distance token
 
     while (in >> vertex >> token) {
-        if (vertex != static_cast<int>(distances.size())) {
-            distances.resize(vertex + 1, INT_MAX);
-        } else {
-            distances.push_back(INT_MAX);
+        if (vertex < 0) continue;                          // skip bad rows
+        if (vertex >= static_cast<int>(distances.size())) {
+            distances.resize(vertex + 1, INT_MAX);         // grow vector
         }
 
-        if (token == "INF") distances[vertex] = INT_MAX;
-        else distances[vertex] = stoi(token);
+        if (token == "INF") distances[vertex] = INT_MAX;   // unreachable
+        else distances[vertex] = stoi(token);              // normal value
     }
 
     return true;
 }
 
 bool readParentFile(const string& path, vector<int>& parents) {
-    ifstream in(path);
-    if (!in.is_open()) return false;
+    ifstream in(path);                                     // open file
+    if (!in.is_open()) return false;                      // fail if missing
 
-    parents.clear();
-    int vertex, parent;
+    parents.clear();                                       // reset output
+    int vertex;                                            // vertex id
+    int parent;                                            // parent id
 
     while (in >> vertex >> parent) {
-        if (vertex != static_cast<int>(parents.size())) {
-            parents.resize(vertex + 1, -1);
-        } else {
-            parents.push_back(-1);
+        if (vertex < 0) continue;                          // skip bad rows
+        if (vertex >= static_cast<int>(parents.size())) {
+            parents.resize(vertex + 1, -1);                // grow vector
         }
 
-        parents[vertex] = parent;
+        parents[vertex] = parent;                          // store parent
     }
 
     return true;
 }
 
 bool vectorsEqual(const vector<int>& a, const vector<int>& b) {
-    if (a.size() != b.size()) return false;
+    if (a.size() != b.size()) return false;                // size mismatch
     for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i] != b[i]) return false;
+        if (a[i] != b[i]) return false;                    // value mismatch
     }
-    return true;
-}
-
-bool loadInitialCandidatesFromChanges(const string& insertPath,
-                                      const string& deletePath,
-                                      vector<int>& initialCandidates) {
-    vector<char> seen(100000, 0);
-    initialCandidates.clear();
-
-    auto addVertex = [&](int v) {
-        if (v < 0) return;
-        if (v >= static_cast<int>(seen.size())) {
-            seen.resize(v + 1, 0);
-        }
-        if (!seen[v]) {
-            seen[v] = 1;
-            initialCandidates.push_back(v);
-        }
-    };
-
-    {
-        ifstream in(insertPath);
-        if (!in.is_open()) return false;
-
-        string line;
-        while (getline(in, line)) {
-            if (line.empty()) continue;
-            istringstream iss(line);
-            int u, v;
-            if (!(iss >> u >> v)) continue;
-            addVertex(u);
-            addVertex(v);
-        }
-    }
-
-    {
-        ifstream in(deletePath);
-        if (!in.is_open()) return false;
-
-        string line;
-        while (getline(in, line)) {
-            if (line.empty()) continue;
-            istringstream iss(line);
-            int u, v;
-            if (!(iss >> u >> v)) continue;
-            addVertex(u);
-            addVertex(v);
-        }
-    }
-
-    return true;
-}
-
-bool prepareGraphs(const string& prefix,
-                   int objectiveIndex,
-                   HostCsrGraph& outgoingCSR,
-                   HostCsrGraph& incomingCSR,
-                   DeviceCsrGraph& deviceIncomingCSR) {
-    Graph graph;
-    int numberOfObjectives = 0;
-
-    if (!readCSR(prefix, graph, numberOfObjectives)) {
-        return false;
-    }
-
-    if (objectiveIndex < 0 || objectiveIndex >= numberOfObjectives) {
-        return false;
-    }
-
-    if (!buildOutgoingCSR(graph, objectiveIndex, outgoingCSR)) {
-        return false;
-    }
-
-    if (!buildIncomingCSR(graph, objectiveIndex, incomingCSR)) {
-        return false;
-    }
-
-    if (!copyHostCsrToDevice(incomingCSR, deviceIncomingCSR)) {
-        return false;
-    }
-
-    return true;
+    return true;                                           // exact match
 }
 
 void printVectorCompact(const string& name, const vector<int>& values) {
-    cout << name << ": ";
+    cout << name << ": ";                                  // label
     for (int x : values) {
         if (x == INT_MAX) cout << "INF ";
         else cout << x << " ";
@@ -163,74 +78,100 @@ void printVectorCompact(const string& name, const vector<int>& values) {
     cout << "\n";
 }
 
+bool compareDistanceAndParentFiles(const string& expectedDistPath,
+                                   const string& expectedParentPath,
+                                   const string& actualDistPath,
+                                   const string& actualParentPath,
+                                   bool& distanceMatch,
+                                   bool& parentMatch,
+                                   vector<int>& expectedDistances,
+                                   vector<int>& expectedParents,
+                                   vector<int>& actualDistances,
+                                   vector<int>& actualParents) {
+    if (!readDistanceFile(expectedDistPath, expectedDistances)) return false;
+    if (!readParentFile(expectedParentPath, expectedParents)) return false;
+    if (!readDistanceFile(actualDistPath, actualDistances)) return false;
+    if (!readParentFile(actualParentPath, actualParents)) return false;
+
+    distanceMatch = vectorsEqual(expectedDistances, actualDistances); // compare dist
+    parentMatch = vectorsEqual(expectedParents, actualParents);       // compare tree
+    return true;
+}
+
 } // namespace
 
 int main() {
-    const int totalRuns = 50;
-    const string baseDir = "cudaStressTest";
+    const int totalRuns = 50;                               // number of random cases
+    const string baseDir = "cudaStressTest";                // output root
+    const int source = 0;                                   // fixed source
+    const bool directed = true;                             // directed graph
 
-    mt19937 rng(random_device{}());
-    uniform_int_distribution<int> nodesDist(4, 30);
-    uniform_int_distribution<int> objDist(1, 3);
-    uniform_int_distribution<int> weightDist(1, 50);
-    uniform_int_distribution<int> changeDist(1, 10);
-    uniform_int_distribution<int> pctDist(0, 100);
-    uniform_int_distribution<unsigned int> seedDist(1, 999999);
+    mt19937 rng(random_device{}());                         // random generator
+    uniform_int_distribution<int> nodesDist(4, 30);        // graph size
+    uniform_int_distribution<int> objDist(1, 3);           // objectives
+    uniform_int_distribution<int> weightDist(1, 50);       // max weight
+    uniform_int_distribution<int> changeDist(1, 10);       // number of changed edges
+    uniform_int_distribution<int> pctDist(0, 100);         // insert %
+    uniform_int_distribution<unsigned int> seedDist(1, 999999); // random seeds
 
-    int distancePassCount = 0;
-    int fullPassCount = 0;
-    int parentWarningCount = 0;
-    int distanceFailCount = 0;
-    int pipelineErrorCount = 0;
+    int objectiveDistancePassCount = 0;                     // per-objective distance passes
+    int objectiveFullPassCount = 0;                         // per-objective full passes
+    int objectiveParentWarningCount = 0;                    // parent-only warnings
+    int objectiveDistanceFailCount = 0;                     // per-objective distance failures
+    int combinedPassCount = 0;                              // combined graph passes
+    int combinedFailCount = 0;                              // combined graph failures
+    int pipelineErrorCount = 0;                             // setup/runtime errors
+    int totalObjectiveChecks = 0;                           // total objective checks
 
     for (int run = 0; run < totalRuns; ++run) {
-        int numberOfNodes = nodesDist(rng);
-        int minEdges = numberOfNodes - 1;
+        int numberOfNodes = nodesDist(rng);                 // random graph size
+        int minEdges = numberOfNodes - 1;                   // keep graph reasonable
         int maxEdges = min(numberOfNodes * (numberOfNodes - 1), minEdges + 40);
         uniform_int_distribution<int> edgeDist(minEdges, maxEdges);
-        int numberOfEdges = edgeDist(rng);
+        int numberOfEdges = edgeDist(rng);                  // random edge count
 
-        int numberOfObjectives = objDist(rng);
-        int objectiveEndRange = weightDist(rng);
-        int objectiveIndex =
-            uniform_int_distribution<int>(0, numberOfObjectives - 1)(rng);
+        int numberOfObjectives = objDist(rng);              // random objectives
+        int objectiveEndRange = weightDist(rng);            // random max weight
+        int numberOfChangedEdges = changeDist(rng);         // random changes
+        int insertPct = pctDist(rng);                       // insertion %
+        int deletePct = 100 - insertPct;                    // deletion %
 
-        int numberOfChangedEdges = changeDist(rng);
-        int insertPct = pctDist(rng);
-        int deletePct = 100 - insertPct;
+        unsigned int graphSeed = seedDist(rng);             // graph seed
+        unsigned int changeSeed = seedDist(rng);            // change seed
 
-        unsigned int graphSeed = seedDist(rng);
-        unsigned int changeSeed = seedDist(rng);
-
-        string dir = baseDir + "/run" + to_string(run);
+        string dir = baseDir + "/run" + to_string(run);     // per-run dir
         string originalPrefix = dir + "/originalGraph/graphCsr";
         string updatedPrefix = dir + "/updatedGraph/updatedGraphCsr";
         string insertPath = dir + "/changedEdges/insert.txt";
         string deletePath = dir + "/changedEdges/delete.txt";
         string expectedDir = dir + "/expected";
+        string cudaDir = dir + "/cuda";
+        string expectedCombinedDir = dir + "/expectedCombined";
+        string cudaCombinedDir = dir + "/cudaCombined";
 
-        bool ok = true;
+        filesystem::create_directories(dir + "/originalGraph");   // make dirs
+        filesystem::create_directories(dir + "/updatedGraph");
+        filesystem::create_directories(dir + "/changedEdges");
+        filesystem::create_directories(expectedDir);
+        filesystem::create_directories(cudaDir);
+        filesystem::create_directories(expectedCombinedDir);
+        filesystem::create_directories(cudaCombinedDir);
 
-        ok = ok && generateGraphCSR(numberOfNodes, numberOfEdges, true,
+        bool ok = true;                                     // pipeline status
+
+        ok = ok && generateGraphCSR(numberOfNodes, numberOfEdges, directed,
                                     originalPrefix, numberOfObjectives,
                                     1, objectiveEndRange, graphSeed);
 
         ok = ok && generateChangedEdges(1, objectiveEndRange, numberOfObjectives,
                                         numberOfNodes, numberOfChangedEdges,
-                                        insertPct, deletePct, true, true, true,
-                                        false, originalPrefix, insertPath,
+                                        insertPct, deletePct, directed,
+                                        true, true, false,
+                                        originalPrefix, insertPath,
                                         deletePath, changeSeed);
 
         ok = ok && updateGraphCSR(originalPrefix, updatedPrefix,
-                                  insertPath, deletePath, true);
-
-        ok = ok && runDijkstraCSR(originalPrefix, objectiveIndex, 0,
-                                  expectedDir + "/distancesOriginal.txt",
-                                  expectedDir + "/SSSPTreeOriginal.txt");
-
-        ok = ok && runDijkstraCSR(updatedPrefix, objectiveIndex, 0,
-                                  expectedDir + "/distancesUpdated.txt",
-                                  expectedDir + "/SSSPTreeUpdated.txt");
+                                  insertPath, deletePath, directed);
 
         if (!ok) {
             cout << "Run " << run << ": ERROR (pipeline setup failed)\n";
@@ -238,119 +179,224 @@ int main() {
             continue;
         }
 
-        vector<int> originalDistances;
-        vector<int> originalParents;
-        vector<int> expectedUpdatedDistances;
-        vector<int> expectedUpdatedParents;
+        vector<string> expectedTreePaths(numberOfObjectives); // expected updated trees
+        vector<string> cudaTreePaths(numberOfObjectives);     // CUDA updated trees
+        bool runHasObjectiveDistanceFail = false;             // track objective failure
+        bool runHasPipelineError = false;                    // track per-run error
 
-        ok = ok && readDistanceFile(expectedDir + "/distancesOriginal.txt", originalDistances);
-        ok = ok && readParentFile(expectedDir + "/SSSPTreeOriginal.txt", originalParents);
-        ok = ok && readDistanceFile(expectedDir + "/distancesUpdated.txt", expectedUpdatedDistances);
-        ok = ok && readParentFile(expectedDir + "/SSSPTreeUpdated.txt", expectedUpdatedParents);
+        for (int obj = 0; obj < numberOfObjectives; ++obj) {
+            ++totalObjectiveChecks;                          // count this objective
 
-        if (!ok) {
-            cout << "Run " << run << ": ERROR (failed to read baseline files)\n";
+            string expectedObjDir = expectedDir + "/obj" + to_string(obj);
+            string cudaObjDir = cudaDir + "/obj" + to_string(obj);
+            filesystem::create_directories(expectedObjDir);  // make dirs
+            filesystem::create_directories(cudaObjDir);
+
+            string originalDistPath = expectedObjDir + "/distancesOriginal.txt";
+            string originalTreePath = expectedObjDir + "/SSSPTreeOriginal.txt";
+            string expectedUpdatedDistPath = expectedObjDir + "/distancesUpdated.txt";
+            string expectedUpdatedTreePath = expectedObjDir + "/SSSPTreeUpdated.txt";
+            string cudaUpdatedDistPath = cudaObjDir + "/distancesUpdated.txt";
+            string cudaUpdatedTreePath = cudaObjDir + "/SSSPTreeUpdated.txt";
+
+            ok = true;                                      // reset for this objective
+
+            ok = ok && runDijkstraCSR(originalPrefix, obj, source,  // original baseline
+                                      originalDistPath,
+                                      originalTreePath);
+
+            ok = ok && sequentialSOSPUpdate(originalPrefix,          // CPU incremental baseline
+                                originalDistPath,
+                                originalTreePath,
+                                insertPath,
+                                deletePath,
+                                obj,
+                                source,
+                                expectedUpdatedDistPath,
+                                expectedUpdatedTreePath);
+
+            ok = ok && cudaParallelSOSPUpdate(updatedPrefix,        // public CUDA path
+                                              originalDistPath,
+                                              originalTreePath,
+                                              insertPath,
+                                              deletePath,
+                                              obj,
+                                              source,
+                                              cudaUpdatedDistPath,
+                                              cudaUpdatedTreePath);
+
+            if (!ok) {
+                cout << "Run " << run << ", obj " << obj
+                     << ": ERROR (objective pipeline failed)\n";
+                ++pipelineErrorCount;
+                runHasPipelineError = true;
+                break;
+            }
+
+            expectedTreePaths[obj] = expectedUpdatedTreePath;       // keep expected tree
+            cudaTreePaths[obj] = cudaUpdatedTreePath;               // keep CUDA tree
+
+            bool distanceMatch = false;                             // compare results
+            bool parentMatch = false;
+            vector<int> expectedDistances;
+            vector<int> expectedParents;
+            vector<int> actualDistances;
+            vector<int> actualParents;
+
+            ok = compareDistanceAndParentFiles(expectedUpdatedDistPath,
+                                               expectedUpdatedTreePath,
+                                               cudaUpdatedDistPath,
+                                               cudaUpdatedTreePath,
+                                               distanceMatch,
+                                               parentMatch,
+                                               expectedDistances,
+                                               expectedParents,
+                                               actualDistances,
+                                               actualParents);
+
+            if (!ok) {
+                cout << "Run " << run << ", obj " << obj
+                     << ": ERROR (failed to read objective outputs)\n";
+                ++pipelineErrorCount;
+                runHasPipelineError = true;
+                break;
+            }
+
+            if (distanceMatch) ++objectiveDistancePassCount;        // count distance pass
+
+            if (distanceMatch && parentMatch) {
+                ++objectiveFullPassCount;                           // exact objective match
+            } else if (distanceMatch && !parentMatch) {
+                ++objectiveParentWarningCount;                     // only parent differs
+                cout << "Run " << run << ", obj " << obj
+                     << ": WARNING (parent mismatch only)"
+                     << " (nodes=" << numberOfNodes
+                     << " edges=" << numberOfEdges
+                     << " objs=" << numberOfObjectives
+                     << " changes=" << numberOfChangedEdges
+                     << " ins%=" << insertPct
+                     << " graphSeed=" << graphSeed
+                     << " changeSeed=" << changeSeed
+                     << ")\n";
+                printVectorCompact("  CPU Parent", expectedParents);
+                printVectorCompact("  GPU Parent", actualParents);
+            } else {
+                ++objectiveDistanceFailCount;                      // real objective failure
+                runHasObjectiveDistanceFail = true;
+                cout << "Run " << run << ", obj " << obj
+                     << ": FAIL (distance mismatch)"
+                     << " (nodes=" << numberOfNodes
+                     << " edges=" << numberOfEdges
+                     << " objs=" << numberOfObjectives
+                     << " changes=" << numberOfChangedEdges
+                     << " ins%=" << insertPct
+                     << " graphSeed=" << graphSeed
+                     << " changeSeed=" << changeSeed
+                     << ")\n";
+                printVectorCompact("  CPU Dist", expectedDistances);
+                printVectorCompact("  GPU Dist", actualDistances);
+
+                if (!parentMatch) {
+                    printVectorCompact("  CPU Parent", expectedParents);
+                    printVectorCompact("  GPU Parent", actualParents);
+                }
+            }
+        }
+
+        if (runHasPipelineError) continue;                         // skip combined check
+        if (runHasObjectiveDistanceFail) {
+            ++combinedFailCount;                                   // combined run already not valid
+            continue;
+        }
+
+        bool combinedOk = true;                                    // combined stage
+
+        combinedOk = combinedOk && cudaCombinedGraph(originalPrefix,
+                                                     expectedTreePaths,
+                                                     numberOfObjectives,
+                                                     source,
+                                                     expectedCombinedDir,
+                                                     expectedCombinedDir + "/distancesCsr.txt",
+                                                     expectedCombinedDir + "/SSSPTreeCsr.txt");
+
+        combinedOk = combinedOk && cudaCombinedGraph(originalPrefix,
+                                                     cudaTreePaths,
+                                                     numberOfObjectives,
+                                                     source,
+                                                     cudaCombinedDir,
+                                                     cudaCombinedDir + "/distancesCsr.txt",
+                                                     cudaCombinedDir + "/SSSPTreeCsr.txt");
+
+        if (!combinedOk) {
+            cout << "Run " << run << ": ERROR (combined graph stage failed)\n";
             ++pipelineErrorCount;
             continue;
         }
 
-        HostCsrGraph updatedOutgoingCSR;
-        HostCsrGraph updatedIncomingCSR;
-        DeviceCsrGraph deviceUpdatedIncomingCSR;
+        bool combinedDistanceMatch = false;                        // compare combined outputs
+        bool combinedParentMatch = false;
+        vector<int> expectedCombinedDistances;
+        vector<int> expectedCombinedParents;
+        vector<int> actualCombinedDistances;
+        vector<int> actualCombinedParents;
 
-        ok = ok && prepareGraphs(updatedPrefix, objectiveIndex,
-                                 updatedOutgoingCSR, updatedIncomingCSR,
-                                 deviceUpdatedIncomingCSR);
+        combinedOk = compareDistanceAndParentFiles(expectedCombinedDir + "/distancesCsr.txt",
+                                                   expectedCombinedDir + "/SSSPTreeCsr.txt",
+                                                   cudaCombinedDir + "/distancesCsr.txt",
+                                                   cudaCombinedDir + "/SSSPTreeCsr.txt",
+                                                   combinedDistanceMatch,
+                                                   combinedParentMatch,
+                                                   expectedCombinedDistances,
+                                                   expectedCombinedParents,
+                                                   actualCombinedDistances,
+                                                   actualCombinedParents);
 
-        if (!ok) {
-            cout << "Run " << run << ": ERROR (failed to prepare CUDA graphs)\n";
+        if (!combinedOk) {
+            cout << "Run " << run << ": ERROR (failed to read combined outputs)\n";
             ++pipelineErrorCount;
             continue;
         }
 
-        vector<int> initialCandidates;
-        ok = ok && loadInitialCandidatesFromChanges(insertPath, deletePath, initialCandidates);
-
-        if (!ok) {
-            cout << "Run " << run << ": ERROR (failed to load initial candidates)\n";
-            freeDeviceCsr(deviceUpdatedIncomingCSR);
-            ++pipelineErrorCount;
-            continue;
-        }
-
-        vector<int> cudaUpdatedDistances;
-        vector<int> cudaUpdatedParents;
-
-        ok = ok && runHybridIncrementalSOSPUpdate(updatedOutgoingCSR,
-                                                  updatedIncomingCSR,
-                                                  deviceUpdatedIncomingCSR,
-                                                  originalDistances,
-                                                  originalParents,
-                                                  initialCandidates,
-                                                  deletePath,
-                                                  0,
-                                                  cudaUpdatedDistances,
-                                                  cudaUpdatedParents);
-
-        freeDeviceCsr(deviceUpdatedIncomingCSR);
-
-        if (!ok) {
-            cout << "Run " << run << ": ERROR (CUDA incremental update failed)\n";
-            ++pipelineErrorCount;
-            continue;
-        }
-
-        bool distanceMatch = vectorsEqual(expectedUpdatedDistances, cudaUpdatedDistances);
-        bool parentMatch = vectorsEqual(expectedUpdatedParents, cudaUpdatedParents);
-
-        if (distanceMatch) {
-            ++distancePassCount;
-        }
-
-        if (distanceMatch && parentMatch) {
-            ++fullPassCount;
-        } else if (distanceMatch && !parentMatch) {
-            ++parentWarningCount;
-            cout << "Run " << run << ": WARNING (parent mismatch only)"
-                 << " (nodes=" << numberOfNodes
-                 << " edges=" << numberOfEdges
-                 << " objs=" << numberOfObjectives
-                 << " objIdx=" << objectiveIndex
-                 << " changes=" << numberOfChangedEdges
-                 << " ins%=" << insertPct
-                 << " graphSeed=" << graphSeed
-                 << " changeSeed=" << changeSeed
-                 << ")\n";
-            printVectorCompact("  CPU Parent", expectedUpdatedParents);
-            printVectorCompact("  GPU Parent", cudaUpdatedParents);
+        if (combinedDistanceMatch && combinedParentMatch) {
+            ++combinedPassCount;                                   // final MOSP pass
         } else {
-            ++distanceFailCount;
-            cout << "Run " << run << ": FAIL (distance mismatch)"
+            ++combinedFailCount;                                   // final MOSP fail
+            cout << "Run " << run << ": FAIL (combined graph mismatch)"
                  << " (nodes=" << numberOfNodes
                  << " edges=" << numberOfEdges
                  << " objs=" << numberOfObjectives
-                 << " objIdx=" << objectiveIndex
                  << " changes=" << numberOfChangedEdges
                  << " ins%=" << insertPct
                  << " graphSeed=" << graphSeed
                  << " changeSeed=" << changeSeed
                  << ")\n";
-            printVectorCompact("  CPU Dist", expectedUpdatedDistances);
-            printVectorCompact("  GPU Dist", cudaUpdatedDistances);
+            printVectorCompact("  EXP Combined Dist", expectedCombinedDistances);
+            printVectorCompact("  CUDA Combined Dist", actualCombinedDistances);
 
-            if (!parentMatch) {
-                printVectorCompact("  CPU Parent", expectedUpdatedParents);
-                printVectorCompact("  GPU Parent", cudaUpdatedParents);
+            if (!combinedParentMatch) {
+                printVectorCompact("  EXP Combined Parent", expectedCombinedParents);
+                printVectorCompact("  CUDA Combined Parent", actualCombinedParents);
             }
         }
     }
 
     cout << "\n=== CUDA Stress Test Summary ===\n";
-    cout << "Distance matches      : " << distancePassCount << "/" << totalRuns << "\n";
-    cout << "Full matches          : " << fullPassCount << "/" << totalRuns << "\n";
-    cout << "Parent-only warnings  : " << parentWarningCount << "/" << totalRuns << "\n";
-    cout << "Distance failures     : " << distanceFailCount << "/" << totalRuns << "\n";
-    cout << "Pipeline errors       : " << pipelineErrorCount << "/" << totalRuns << "\n";
+    cout << "Objective distance matches : " << objectiveDistancePassCount
+         << "/" << totalObjectiveChecks << "\n";
+    cout << "Objective full matches     : " << objectiveFullPassCount
+         << "/" << totalObjectiveChecks << "\n";
+    cout << "Parent-only warnings       : " << objectiveParentWarningCount
+         << "/" << totalObjectiveChecks << "\n";
+    cout << "Objective distance fails   : " << objectiveDistanceFailCount
+         << "/" << totalObjectiveChecks << "\n";
+    cout << "Combined graph passes      : " << combinedPassCount
+         << "/" << totalRuns << "\n";
+    cout << "Combined graph fails       : " << combinedFailCount
+         << "/" << totalRuns << "\n";
+    cout << "Pipeline errors            : " << pipelineErrorCount
+         << "/" << totalRuns << "\n";
 
-    return (distanceFailCount > 0 || pipelineErrorCount > 0) ? 1 : 0;
+    return (objectiveDistanceFailCount > 0 ||
+            combinedFailCount > 0 ||
+            pipelineErrorCount > 0) ? 1 : 0;
 }

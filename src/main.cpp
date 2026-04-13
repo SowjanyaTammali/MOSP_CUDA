@@ -1,470 +1,331 @@
-#include "../headers/read.h"
-#include "../headers/cuda_graph.cuh"
-#include "../headers/cuda_kernels.cuh"
-#include "../headers/cuda_sosp_update.cuh"
-#include "../headers/updateGraphCSR.h"
-#include "../headers/sequentialSOSPUpdate.h"
-#include "../headers/cudaCombinedGraph.cuh"
-#include "../headers/cudaMOSPWorkflow.cuh"
-#include "../headers/dijkstra.h"
-#include "../headers/generateGraphCSR.h"
-#include "../headers/generateChangedEdges.h"
+#include <climits>      // INT_MAX
+#include <filesystem>   // folders
+#include <fstream>      // file io
+#include <iostream>     // cout/cerr
+#include <string>       // strings
+#include <vector>       // vector
 
-#include <climits>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <sstream>
-#include <string>
-#include <vector>
+#include "../headers/read.h"                    // readCSR
+#include "../headers/dijkstra.h"                // runDijkstraCSR
+#include "../headers/generateChangedEdges.h"    // generate insert/delete files
+#include "../headers/generateGraphCSR.h"        // build original CSR graph
+#include "../headers/cudaCombinedGraph.cuh"     // combine objective trees
+#include "../headers/cudaParallelSOSPUpdate.cuh"// CUDA incremental update
+#include "../headers/sequentialSOSPUpdate.h"    // CPU incremental update
+#include "../headers/updateGraphCSR.h"          // build updated CSR graph
 
-/**
- * @file main.cpp
- * @brief Runs CUDA SOSP, CPU sequential SOSP baseline, CUDA incremental update,
- *        CUDA combined graph mode, CUDA workflow mode, or a full OpenMP-style pipeline mode.
- */
+using namespace std;
 
-void printVector(const std::string& name, const std::vector<int>& values) {
-    std::cout << "\n--- " << name << " ---\n";
-    for (int x : values) {
-        if (x == INT_MAX) std::cout << "INF ";
-        else std::cout << x << " ";
-    }
-    std::cout << "\n";
-}
+namespace {
 
-bool vectorsEqual(const std::vector<int>& a, const std::vector<int>& b) {
-    if (a.size() != b.size()) return false;
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i] != b[i]) return false;
-    }
-    return true;
-}
+bool readDistanceFile(const string& path, vector<int>& distances) {
+    ifstream in(path);                                           // open file
+    if (!in.is_open()) return false;                             // fail if missing
 
-bool writeVectorToFile(const std::string& path, const std::vector<int>& values) {
-    std::filesystem::path outPath(path);
-    if (!outPath.parent_path().empty()) {
-        std::filesystem::create_directories(outPath.parent_path());
-    }
+    distances.clear();                                           // reset output
+    int vertex = 0;                                              // vertex id
+    string token;                                                // distance token
 
-    std::ofstream out(path);
-    if (!out.is_open()) {
-        std::cerr << "Error: could not write file: " << path << "\n";
-        return false;
-    }
-
-    for (size_t i = 0; i < values.size(); ++i) {
-        out << i << " ";
-        if (values[i] == INT_MAX) out << "INF";
-        else out << values[i];
-        out << "\n";
-    }
-
-    return true;
-}
-
-bool readVectorFromFile(const std::string& path, std::vector<int>& values) {
-    std::ifstream in(path);
-    if (!in.is_open()) {
-        std::cerr << "Error: could not read file: " << path << "\n";
-        return false;
-    }
-
-    values.clear();
-
-    int vertex;
-    std::string token;
     while (in >> vertex >> token) {
-        if (vertex != static_cast<int>(values.size())) {
-            values.resize(vertex + 1, INT_MAX);
-        } else {
-            values.push_back(INT_MAX);
+        if (vertex < 0) continue;                                // skip bad row
+        if (vertex >= static_cast<int>(distances.size())) {
+            distances.resize(vertex + 1, INT_MAX);               // grow vector
         }
 
-        if (token == "INF") values[vertex] = INT_MAX;
-        else values[vertex] = std::stoi(token);
+        if (token == "INF") distances[vertex] = INT_MAX;         // unreachable
+        else distances[vertex] = stoi(token);                    // normal value
     }
 
     return true;
 }
 
-bool prepareGraphs(const std::string& prefix,
-                   int objectiveIndex,
-                   HostCsrGraph& outgoingCSR,
-                   HostCsrGraph& incomingCSR,
-                   DeviceCsrGraph& deviceIncomingCSR) {
-    Graph graph;
-    int numberOfObjectives = 0;
-
-    if (!readCSR(prefix, graph, numberOfObjectives)) {
-        std::cerr << "Error: failed to read CSR graph from " << prefix << "\n";
-        return false;
-    }
-
-    if (objectiveIndex < 0 || objectiveIndex >= numberOfObjectives) {
-        std::cerr << "Error: invalid objective index.\n";
-        return false;
-    }
-
-    if (!buildOutgoingCSR(graph, objectiveIndex, outgoingCSR)) {
-        std::cerr << "Error: failed to build outgoing CSR.\n";
-        return false;
-    }
-
-    if (!buildIncomingCSR(graph, objectiveIndex, incomingCSR)) {
-        std::cerr << "Error: failed to build incoming CSR.\n";
-        return false;
-    }
-
-    if (!copyHostCsrToDevice(incomingCSR, deviceIncomingCSR)) {
-        std::cerr << "Error: failed to copy incoming CSR to device.\n";
-        return false;
-    }
-
-    return true;
+bool distanceFilesMatch(const string& pathA, const string& pathB) {
+    vector<int> a, b;                                            // two distance arrays
+    if (!readDistanceFile(pathA, a)) return false;               // read A
+    if (!readDistanceFile(pathB, b)) return false;               // read B
+    return a == b;                                               // exact distance match
 }
 
-bool loadInitialCandidatesFromChanges(const std::string& insertPath,
-                                      const std::string& deletePath,
-                                      std::vector<int>& initialCandidates) {
-    std::vector<char> seen(100000, 0);
-    initialCandidates.clear();
-
-    auto addVertex = [&](int v) {
-        if (v < 0) return;
-        if (v >= static_cast<int>(seen.size())) {
-            seen.resize(v + 1, 0);
-        }
-        if (!seen[v]) {
-            seen[v] = 1;
-            initialCandidates.push_back(v);
-        }
-    };
-
-    {
-        std::ifstream in(insertPath);
-        if (!in.is_open()) {
-            std::cerr << "Error: could not open insert file: " << insertPath << "\n";
-            return false;
-        }
-
-        std::string line;
-        while (std::getline(in, line)) {
-            if (line.empty()) continue;
-            std::istringstream iss(line);
-            int u, v;
-            if (!(iss >> u >> v)) continue;
-            addVertex(u);
-            addVertex(v);
-        }
+bool runPipelineFromFiles(const string& originalGraphPrefix,
+                          const string& updatedGraphPrefix,
+                          const string& insertPath,
+                          const string& deletePath,
+                          int source) {
+    Graph graph;                                                 // read original graph
+    int numberOfObjectives = 0;                                  // objective count
+    if (!readCSR(originalGraphPrefix, graph, numberOfObjectives)) {
+        cerr << "Error: failed to read original graph.\n";
+        return false;
     }
 
-    {
-        std::ifstream in(deletePath);
-        if (!in.is_open()) {
-            std::cerr << "Error: could not open delete file: " << deletePath << "\n";
-            return false;
-        }
-
-        std::string line;
-        while (std::getline(in, line)) {
-            if (line.empty()) continue;
-            std::istringstream iss(line);
-            int u, v;
-            if (!(iss >> u >> v)) continue;
-            addVertex(u);
-            addVertex(v);
-        }
+    if (numberOfObjectives <= 0) {
+        cerr << "Error: invalid number of objectives.\n";
+        return false;
     }
 
-    return true;
-}
+    const string distancesTreesDir = "output/distancesTrees";                // original outputs
+    const string updatedDistancesTreesDir = "output/updatedDistancesTrees";  // updated outputs
+    const string sospUpdateDir = "output/sospUpdateDistancesTrees";          // CPU update outputs
 
-int main(int argc, char* argv[]) {
-    if (argc >= 2 && std::string(argv[1]) == "full") {
-        if (argc < 9) {
-            std::cerr << "Usage: " << argv[0]
-                      << " full <numNodes> <numEdges> <numObjectives> <objectiveMaxWeight> <numChangedEdges> <insertPct> <source>\n";
-            return 1;
-        }
+    filesystem::create_directories("output");                                // root output
+    filesystem::create_directories(distancesTreesDir);                       // original baseline dir
+    filesystem::create_directories(updatedDistancesTreesDir);                // updated baseline dir
+    filesystem::create_directories(sospUpdateDir);                           // CPU baseline dir
+    filesystem::create_directories("output/combinedGraph");                  // combined graph dir
 
-        int numberOfNodes = std::stoi(argv[2]);
-        int numberOfEdges = std::stoi(argv[3]);
-        int numberOfObjectives = std::stoi(argv[4]);
-        int objectiveMaxWeight = std::stoi(argv[5]);
-        int numberOfChangedEdges = std::stoi(argv[6]);
-        int insertPct = std::stoi(argv[7]);
-        int source = std::stoi(argv[8]);
+    const int objectiveNumber = 0;                                           // OpenMP-style baseline objective
 
-        int deletePct = 100 - insertPct;
-        unsigned int graphSeed = 12345;
-        unsigned int changeSeed = 54321;
-
-        std::string originalPrefix = "data/originalGraph/graphCsr";
-        std::string updatedPrefix = "data/updatedGraph/updatedGraphCsr";
-        std::string insertPath = "data/changes/insert.txt";
-        std::string deletePath = "data/changes/delete.txt";
-
-        std::string originalDistancesPath = "output/distancesTrees/distancesCsr.txt";
-        std::string originalTreePath = "output/distancesTrees/SSSPTreeCsr.txt";
-        std::string updatedDistancesPath = "output/updatedDistancesTrees/updatedDistancesCsr.txt";
-        std::string updatedTreePath = "output/updatedDistancesTrees/updatedSSSPTreeCsr.txt";
-        std::string baselineDistancesPath = "output/sospUpdateDistancesTrees/distancesCsr.txt";
-        std::string baselineTreePath = "output/sospUpdateDistancesTrees/SSSPTreeCsr.txt";
-
-        bool ok = true;
-
-        ok = ok && generateGraphCSR(numberOfNodes, numberOfEdges, true,
-                                    originalPrefix, numberOfObjectives,
-                                    1, objectiveMaxWeight, graphSeed);
-
-        ok = ok && generateChangedEdges(1, objectiveMaxWeight, numberOfObjectives,
-                                        numberOfNodes, numberOfChangedEdges,
-                                        insertPct, deletePct, true, true, true,
-                                        false, originalPrefix, insertPath,
-                                        deletePath, changeSeed);
-
-        ok = ok && updateGraphCSR(originalPrefix, updatedPrefix, insertPath, deletePath, true);
-
-        ok = ok && runDijkstraCSR(originalPrefix, 0, source,
-                                  originalDistancesPath, originalTreePath);
-
-        ok = ok && runDijkstraCSR(updatedPrefix, 0, source,
-                                  updatedDistancesPath, updatedTreePath);
-
-        ok = ok && sequentialSOSPUpdate(originalPrefix,
-                                        originalDistancesPath,
-                                        originalTreePath,
-                                        insertPath,
-                                        deletePath,
-                                        0,
-                                        source,
-                                        baselineDistancesPath,
-                                        baselineTreePath);
-
-        ok = ok && runCudaMOSPWorkflow(originalPrefix,
-                                       updatedPrefix,
-                                       insertPath,
-                                       deletePath,
-                                       source);
-
-        if (!ok) {
-            std::cerr << "Error: full pipeline failed.\n";
-            return 1;
-        }
-
-        std::cout << "Full pipeline completed successfully.\n";
-        return 0;
+    if (!runDijkstraCSR(originalGraphPrefix, objectiveNumber, source,        // original baseline
+                        distancesTreesDir + "/distancesCsr.txt",
+                        distancesTreesDir + "/SSSPTreeCsr.txt")) {
+        return false;
     }
 
-    if (argc >= 2 && std::string(argv[1]) == "workflow") {
-        if (argc < 7) {
-            std::cerr << "Usage: " << argv[0]
-                      << " workflow <originalPrefix> <updatedPrefix> <insertFile> <deleteFile> <source>\n";
-            return 1;
-        }
-
-        std::string originalPrefix = argv[2];
-        std::string updatedPrefix = argv[3];
-        std::string insertPath = argv[4];
-        std::string deletePath = argv[5];
-        int source = std::stoi(argv[6]);
-
-        if (!runCudaMOSPWorkflow(originalPrefix, updatedPrefix, insertPath, deletePath, source)) {
-            std::cerr << "Error: runCudaMOSPWorkflow failed.\n";
-            return 1;
-        }
-
-        return 0;
+    if (!runDijkstraCSR(updatedGraphPrefix, objectiveNumber, source,         // updated baseline
+                        updatedDistancesTreesDir + "/updatedDistancesCsr.txt",
+                        updatedDistancesTreesDir + "/updatedSSSPTreeCsr.txt")) {
+        return false;
     }
 
-    if (argc >= 2 && std::string(argv[1]) == "combined") {
-        if (argc < 6) {
-            std::cerr << "Usage: " << argv[0]
-                      << " combined <originalPrefix> <K> <source> <tree1> <tree2> ... <treeK>\n";
-            return 1;
-        }
-
-        std::string originalPrefix = argv[2];
-        int K = std::stoi(argv[3]);
-        int source = std::stoi(argv[4]);
-
-        if (argc < 5 + K) {
-            std::cerr << "Error: not enough tree paths for K.\n";
-            return 1;
-        }
-
-        std::vector<std::string> treeInputPaths;
-        for (int i = 0; i < K; ++i) {
-            treeInputPaths.push_back(argv[5 + i]);
-        }
-
-        if (!cudaCombinedGraph(originalPrefix, treeInputPaths, K, source)) {
-            std::cerr << "Error: cudaCombinedGraph failed.\n";
-            return 1;
-        }
-
-        return 0;
-    }
-
-    if (argc < 7) {
-        std::cerr << "Usage: " << argv[0]
-                  << " <originalPrefix> <updatedPrefix> <insertFile> <deleteFile> <objectiveIndex> <sourceVertex>\n";
-        std::cerr << "Or:    " << argv[0]
-                  << " combined <originalPrefix> <K> <source> <tree1> ... <treeK>\n";
-        std::cerr << "Or:    " << argv[0]
-                  << " workflow <originalPrefix> <updatedPrefix> <insertFile> <deleteFile> <source>\n";
-        std::cerr << "Or:    " << argv[0]
-                  << " full <numNodes> <numEdges> <numObjectives> <objectiveMaxWeight> <numChangedEdges> <insertPct> <source>\n";
-        return 1;
-    }
-
-    std::string originalPrefix = argv[1];
-    std::string updatedPrefix  = argv[2];
-    std::string insertPath     = argv[3];
-    std::string deletePath     = argv[4];
-    int objectiveIndex         = std::stoi(argv[5]);
-    int sourceVertex           = std::stoi(argv[6]);
-
-    std::string outputDir = "output";
-    std::string originalDistancesPath   = outputDir + "/originalCuda/distances.txt";
-    std::string originalParentsPath     = outputDir + "/originalCuda/parents.txt";
-    std::string cpuUpdatedDistancesPath = outputDir + "/cpuBaseline/updatedDistances.txt";
-    std::string cpuUpdatedParentsPath   = outputDir + "/cpuBaseline/updatedParents.txt";
-
-    std::cout << "Original Prefix : " << originalPrefix << "\n";
-    std::cout << "Updated Prefix  : " << updatedPrefix << "\n";
-    std::cout << "Insert File     : " << insertPath << "\n";
-    std::cout << "Delete File     : " << deletePath << "\n";
-    std::cout << "Objective Index : " << objectiveIndex << "\n";
-    std::cout << "Source Vertex   : " << sourceVertex << "\n";
-
-    HostCsrGraph originalOutgoingCSR;
-    HostCsrGraph originalIncomingCSR;
-    DeviceCsrGraph deviceOriginalIncomingCSR;
-
-    if (!prepareGraphs(originalPrefix,
-                       objectiveIndex,
-                       originalOutgoingCSR,
-                       originalIncomingCSR,
-                       deviceOriginalIncomingCSR)) {
-        return 1;
-    }
-
-    std::vector<int> originalDistances;
-    std::vector<int> originalParents;
-
-    if (!runHybridSOSPUpdate(originalOutgoingCSR,
-                             originalIncomingCSR,
-                             deviceOriginalIncomingCSR,
-                             sourceVertex,
-                             originalDistances,
-                             originalParents)) {
-        std::cerr << "Error: hybrid SOSP update failed on original graph.\n";
-        freeDeviceCsr(deviceOriginalIncomingCSR);
-        return 1;
-    }
-
-    printVector("Original Graph Distances (CUDA)", originalDistances);
-    printVector("Original Graph Parents (CUDA)", originalParents);
-
-    freeDeviceCsr(deviceOriginalIncomingCSR);
-
-    if (!writeVectorToFile(originalDistancesPath, originalDistances)) {
-        return 1;
-    }
-
-    if (!writeVectorToFile(originalParentsPath, originalParents)) {
-        return 1;
-    }
-
-    if (!sequentialSOSPUpdate(originalPrefix,
-                              originalDistancesPath,
-                              originalParentsPath,
+    if (!sequentialSOSPUpdate(originalGraphPrefix,                           // CPU SOSP baseline
+                              distancesTreesDir + "/distancesCsr.txt",
+                              distancesTreesDir + "/SSSPTreeCsr.txt",
                               insertPath,
                               deletePath,
-                              objectiveIndex,
-                              sourceVertex,
-                              cpuUpdatedDistancesPath,
-                              cpuUpdatedParentsPath)) {
-        std::cerr << "Error: sequentialSOSPUpdate failed.\n";
+                              objectiveNumber,
+                              source,
+                              sospUpdateDir + "/distancesCsr.txt",
+                              sospUpdateDir + "/SSSPTreeCsr.txt")) {
+        return false;
+    }
+
+    vector<string> objTreePaths(numberOfObjectives);                         // one tree per objective
+
+    for (int obj = 0; obj < numberOfObjectives; ++obj) {
+        const string objDir = "output/parallelSospObj" + to_string(obj);     // match OpenMP layout
+        filesystem::create_directories(objDir);                              // make per-objective dir
+
+        const string objDistOriginal = objDir + "/distancesOriginal.txt";    // original dist
+        const string objTreeOriginal = objDir + "/SSSPTreeOriginal.txt";     // original tree
+        const string objDistOut = objDir + "/distancesUpdated.txt";          // updated dist
+        const string objTreeOut = objDir + "/SSSPTreeUpdated.txt";           // updated tree
+
+        if (!runDijkstraCSR(originalGraphPrefix, obj, source,                // original result
+                            objDistOriginal, objTreeOriginal)) {
+            return false;
+        }
+
+        if (!cudaParallelSOSPUpdate(originalGraphPrefix,                     // OpenMP-style call
+                                    objDistOriginal,
+                                    objTreeOriginal,
+                                    insertPath,
+                                    deletePath,
+                                    obj,
+                                    source,
+                                    objDistOut,
+                                    objTreeOut)) {
+            return false;
+        }
+
+        objTreePaths[obj] = objTreeOut;                                      // store updated tree
+    }
+
+    const string combinedGraphDir = "output/combinedGraph";                  // combined graph dir
+
+    if (!cudaCombinedGraph(originalGraphPrefix,
+                           objTreePaths,
+                           numberOfObjectives,
+                           source,
+                           combinedGraphDir,
+                           combinedGraphDir + "/distancesCsr.txt",
+                           combinedGraphDir + "/SSSPTreeCsr.txt")) {
+        return false;
+    }
+
+    return true;                                                             // success
+}
+
+bool generateDeterministicTestCases() {
+    const int totalTests = 10;                                               // OpenMP-style count
+    int passCount = 0;                                                       // passing tests
+
+    for (int testId = 0; testId < totalTests; ++testId) {
+        const int numberOfNodes = 5 + testId;                                // vary graph size
+        const int maxEdges = numberOfNodes * (numberOfNodes - 1);            // directed max edges
+        const int numberOfEdges = min(maxEdges, numberOfNodes + 4 + testId); // vary edge count
+        const bool directed = true;                                          // directed graph
+        const int numberOfObjectives = 1 + (testId % 3);                     // 1..3 objectives
+        const int objectiveStartRange = 1;                                   // min edge weight
+        const int objectiveEndRange = 9;                                     // max edge weight
+        const int objectiveIndex = testId % numberOfObjectives;              // rotate objective
+        const int source = 0;                                                // fixed source
+        const int numberOfChangedEdges = 1 + (testId % 5);                   // vary changes
+        const double insertionPercentage = 20.0 + (testId * 7) % 61;         // 20..80
+        const double deletionPercentage = 100.0 - insertionPercentage;       // remaining delete %
+        const unsigned int graphSeed = 1000 + testId;                        // deterministic graph seed
+        const unsigned int changeSeed = 2000 + testId;                       // deterministic change seed
+
+        const string testDir = "tests/testCase" + to_string(testId);         // test root
+        const string originalPrefix = testDir + "/originalGraph/graphCsr";   // original CSR prefix
+        const string updatedPrefix = testDir + "/updatedGraph/updatedGraphCsr"; // updated CSR prefix
+        const string insertPath = testDir + "/changedEdges/insert.txt";      // insert file
+        const string deletePath = testDir + "/changedEdges/delete.txt";      // delete file
+        const string expectedDir = testDir + "/expected";                    // expected outputs
+        const string cudaDir = testDir + "/cuda";                            // CUDA outputs
+
+        filesystem::create_directories(testDir + "/originalGraph");          // make dirs
+        filesystem::create_directories(testDir + "/updatedGraph");
+        filesystem::create_directories(testDir + "/changedEdges");
+        filesystem::create_directories(expectedDir);
+        filesystem::create_directories(cudaDir);
+
+        bool ok = true;                                                      // pipeline state
+
+        ok = ok && generateGraphCSR(numberOfNodes, numberOfEdges, directed,
+                                    originalPrefix, numberOfObjectives,
+                                    objectiveStartRange, objectiveEndRange,
+                                    graphSeed);
+
+        ok = ok && generateChangedEdges(objectiveStartRange, objectiveEndRange,
+                                        numberOfObjectives, numberOfNodes,
+                                        numberOfChangedEdges, insertionPercentage,
+                                        deletionPercentage, directed,
+                                        true, true, false,
+                                        originalPrefix, insertPath, deletePath,
+                                        changeSeed);
+
+        ok = ok && updateGraphCSR(originalPrefix, updatedPrefix,
+                                  insertPath, deletePath, directed);
+
+        ok = ok && runDijkstraCSR(originalPrefix, objectiveIndex, source,
+                                  expectedDir + "/distancesOriginal.txt",
+                                  expectedDir + "/SSSPTreeOriginal.txt");
+
+        ok = ok && runDijkstraCSR(updatedPrefix, objectiveIndex, source,
+                                  expectedDir + "/distancesUpdated.txt",
+                                  expectedDir + "/SSSPTreeUpdated.txt");
+
+        ok = ok && sequentialSOSPUpdate(originalPrefix,
+                                        expectedDir + "/distancesOriginal.txt",
+                                        expectedDir + "/SSSPTreeOriginal.txt",
+                                        insertPath, deletePath,
+                                        objectiveIndex, source,
+                                        expectedDir + "/distancesSOSP.txt",
+                                        expectedDir + "/SSSPTreeSOSP.txt");
+
+        ok = ok && cudaParallelSOSPUpdate(originalPrefix,
+                                          expectedDir + "/distancesOriginal.txt",
+                                          expectedDir + "/SSSPTreeOriginal.txt",
+                                          insertPath, deletePath,
+                                          objectiveIndex, source,
+                                          cudaDir + "/distancesUpdated.txt",
+                                          cudaDir + "/SSSPTreeUpdated.txt");
+
+        if (!ok) {
+            cout << "Generating test case " << testId << "...\n";
+            cout << "Test case " << testId << ": ERROR (pipeline failed)\n";
+            continue;
+        }
+
+        const bool distanceMatch =
+            distanceFilesMatch(expectedDir + "/distancesUpdated.txt",
+                               cudaDir + "/distancesUpdated.txt");           // compare against ground truth
+
+        cout << "Generating test case " << testId << "...\n";
+
+        if (distanceMatch) {
+            ++passCount;                                                     // count pass
+            cout << "Test case " << testId
+                 << ": PASS (distances match ground truth)\n";
+        } else {
+            cout << "Test case " << testId
+                 << ": FAIL (distances do not match ground truth)\n";
+        }
+    }
+
+    cout << "\n=== Test Summary: " << passCount << "/" << totalTests
+         << " passed ===\n";
+
+    return passCount == totalTests;                                          // final status
+}
+
+} // namespace
+
+int main(int argc, char* argv[]) {
+    // Optional shared-input mode:
+    // ./bin/main workflow <originalPrefix> <updatedPrefix> <insertPath> <deletePath> <source>
+
+    if (argc == 7 && string(argv[1]) == "workflow") {
+        const string originalGraphPrefix = argv[2];                          // external original CSR prefix
+        const string updatedGraphPrefix = argv[3];                           // external updated CSR prefix
+        const string insertPath = argv[4];                                   // external insert file
+        const string deletePath = argv[5];                                   // external delete file
+        const int source = stoi(argv[6]);                                    // external source
+
+        return runPipelineFromFiles(originalGraphPrefix,
+                                    updatedGraphPrefix,
+                                    insertPath,
+                                    deletePath,
+                                    source) ? 0 : 1;
+    }
+
+    if (argc != 1) {
+        cerr << "Usage:\n";
+        cerr << "  ./bin/main\n";
+        cerr << "  ./bin/main workflow <originalPrefix> <updatedPrefix> "
+                "<insertPath> <deletePath> <source>\n";
         return 1;
     }
 
-    std::vector<int> cpuUpdatedDistances;
-    std::vector<int> cpuUpdatedParents;
+    int numberOfNodes = 5;                                                   // small test graph
+    int numberOfEdges = 6;                                                   // small test graph
+    bool directed = true;                                                    // directed graph
+    int numberOfObjectives = 3;                                              // K objectives
+    int objectiveStartRange = 1;                                             // min edge weight
+    int objectiveEndRange = 9;                                               // max edge weight
+    int source = 0;                                                          // source node
+    int numberOfChangedEdges = 4;                                            // changed edges
+    double insertionPercentage = 50.0;                                       // insert %
+    double deletionPercentage = 50.0;                                        // delete %
 
-    if (!readVectorFromFile(cpuUpdatedDistancesPath, cpuUpdatedDistances)) {
+    const string originalGraphPrefix = "data/originalGraph/graphCsr";        // original CSR
+    const string updatedGraphPrefix = "data/updatedGraph/updatedGraphCsr";   // updated CSR
+    const string insertPath = "output/changedEdges/insert.txt";              // insert file
+    const string deletePath = "output/changedEdges/delete.txt";              // delete file
+
+    filesystem::create_directories("output");                                // root output dir
+    filesystem::create_directories("output/changedEdges");                   // changed-edge dir
+
+    if (!generateGraphCSR(numberOfNodes, numberOfEdges, directed,
+                          originalGraphPrefix, numberOfObjectives,
+                          objectiveStartRange, objectiveEndRange)) {
         return 1;
     }
 
-    if (!readVectorFromFile(cpuUpdatedParentsPath, cpuUpdatedParents)) {
+    if (!generateChangedEdges(objectiveStartRange, objectiveEndRange,
+                              numberOfObjectives, numberOfNodes,
+                              numberOfChangedEdges, insertionPercentage,
+                              deletionPercentage, directed, true, true, false,
+                              originalGraphPrefix, insertPath, deletePath)) {
         return 1;
     }
 
-    printVector("Updated Distances (CPU Baseline)", cpuUpdatedDistances);
-    printVector("Updated Parents (CPU Baseline)", cpuUpdatedParents);
-
-    if (!updateGraphCSR(originalPrefix, updatedPrefix, insertPath, deletePath, true)) {
-        std::cerr << "Error: failed to create updated CSR graph.\n";
+    if (!updateGraphCSR(originalGraphPrefix, updatedGraphPrefix,
+                        insertPath, deletePath, directed)) {
         return 1;
     }
 
-    HostCsrGraph updatedOutgoingCSR;
-    HostCsrGraph updatedIncomingCSR;
-    DeviceCsrGraph deviceUpdatedIncomingCSR;
-
-    if (!prepareGraphs(updatedPrefix,
-                       objectiveIndex,
-                       updatedOutgoingCSR,
-                       updatedIncomingCSR,
-                       deviceUpdatedIncomingCSR)) {
+    if (!runPipelineFromFiles(originalGraphPrefix,
+                              updatedGraphPrefix,
+                              insertPath,
+                              deletePath,
+                              source)) {
         return 1;
     }
 
-    std::vector<int> initialCandidates;
-    if (!loadInitialCandidatesFromChanges(insertPath, deletePath, initialCandidates)) {
-        freeDeviceCsr(deviceUpdatedIncomingCSR);
+    if (!generateDeterministicTestCases()) {                                // OpenMP-style test block
         return 1;
     }
 
-    std::cout << "\nInitial affected vertices for CUDA incremental update: ";
-    for (int v : initialCandidates) std::cout << v << " ";
-    std::cout << "\n";
-
-    std::vector<int> updatedDistances;
-    std::vector<int> updatedParents;
-
-    if (!runHybridIncrementalSOSPUpdate(updatedOutgoingCSR,
-                                        updatedIncomingCSR,
-                                        deviceUpdatedIncomingCSR,
-                                        originalDistances,
-                                        originalParents,
-                                        initialCandidates,
-                                        deletePath,
-                                        sourceVertex,
-                                        updatedDistances,
-                                        updatedParents)) {
-        std::cerr << "Error: hybrid incremental SOSP update failed on updated graph.\n";
-        freeDeviceCsr(deviceUpdatedIncomingCSR);
-        return 1;
-    }
-
-    printVector("Updated Graph Distances (CUDA Incremental)", updatedDistances);
-    printVector("Updated Graph Parents (CUDA Incremental)", updatedParents);
-
-    freeDeviceCsr(deviceUpdatedIncomingCSR);
-
-    if (!vectorsEqual(cpuUpdatedDistances, updatedDistances)) {
-        std::cerr << "Error: CPU and CUDA updated distances do not match.\n";
-        return 1;
-    }
-
-    if (!vectorsEqual(cpuUpdatedParents, updatedParents)) {
-        std::cerr << "Error: CPU and CUDA updated parents do not match.\n";
-        return 1;
-    }
-
-    std::cout << "\nCPU baseline and CUDA incremental update match.\n";
-    return 0;
+    return 0;                                                               // success
 }

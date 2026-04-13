@@ -1,160 +1,85 @@
 #include "../headers/cudaCombinedGraph.cuh"
 #include "../headers/read.h"
-#include "../headers/cuda_graph.cuh"
-#include "../headers/cuda_sosp_update.cuh"
+#include "../headers/dijkstra.h"
 
-#include <climits>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <map>
-#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
-/**
- * @file cudaCombinedGraph.cu
- * @brief Implements hybrid CUDA combined-graph construction and solve.
- */
-
-using namespace std;
-
 namespace {
 
-bool readParentFile(const string& path, vector<int>& parent, int numberOfNodes) {
-    ifstream file(path);
-    if (!file.is_open()) {
-        cout << "Error: Could not open tree file: " << path << "\n";
+struct PairHash {
+    std::size_t operator()(const std::pair<int, int>& p) const {
+        return std::hash<int>()(p.first) ^ (std::hash<int>()(p.second) << 1);
+    }
+};
+
+bool readParentFile(const std::string& path, std::vector<int>& parents) {
+    std::ifstream in(path);                                // open parent file
+    if (!in.is_open()) {
+        std::cerr << "Error: could not read parent file: " << path << "\n";
         return false;
     }
 
-    parent.assign(numberOfNodes, -1);
+    parents.clear();                                       // reset output
+    int vertex = 0;                                        // vertex id
+    std::string token;                                     // parent token
 
-    string line;
-    while (getline(file, line)) {
-        if (line.empty()) continue;
-        istringstream ss(line);
-        int v, p;
-        if (!(ss >> v >> p)) continue;
-        if (v < 0 || v >= numberOfNodes) {
-            cout << "Error: Vertex out of range in tree file: " << path << "\n";
-            return false;
+    while (in >> vertex >> token) {
+        if (vertex < 0) continue;                          // skip bad row
+        if (vertex >= static_cast<int>(parents.size())) {
+            parents.resize(vertex + 1, -1);                // grow if needed
         }
-        parent[v] = p;
+
+        if (token == "INF") parents[vertex] = -1;         // no parent
+        else parents[vertex] = std::stoi(token);          // numeric parent
     }
 
     return true;
 }
 
-bool writeVectorToFile(const string& path, const vector<int>& values) {
-    filesystem::path outPath(path);
-    if (!outPath.parent_path().empty()) {
-        filesystem::create_directories(outPath.parent_path());
+bool writeCombinedGraphCSR(const std::string& prefix,
+                           int numVertices,
+                           const std::vector<std::tuple<int, int, int>>& edges) {
+    std::filesystem::path prefixPath(prefix);              // output prefix path
+    if (!prefixPath.parent_path().empty()) {
+        std::filesystem::create_directories(prefixPath.parent_path()); // make dir
     }
 
-    ofstream out(path);
-    if (!out.is_open()) {
-        return false;
-    }
+    std::vector<std::vector<std::pair<int, int>>> adj(numVertices); // u -> [(v,w)]
 
-    for (size_t i = 0; i < values.size(); ++i) {
-        out << i << " ";
-        if (values[i] == INT_MAX) out << "INF";
-        else out << values[i];
-        out << "\n";
-    }
-
-    return true;
-}
-
-bool writeParentsToFile(const string& path, const vector<int>& parents) {
-    filesystem::path outPath(path);
-    if (!outPath.parent_path().empty()) {
-        filesystem::create_directories(outPath.parent_path());
-    }
-
-    ofstream out(path);
-    if (!out.is_open()) {
-        return false;
-    }
-
-    for (size_t i = 0; i < parents.size(); ++i) {
-        out << i << " " << parents[i] << "\n";
-    }
-
-    return true;
-}
-
-bool writeCombinedCSR(const string& prefix,
-                      int numberOfNodes,
-                      const map<pair<int, int>, int>& edgeMembership,
-                      int K) {
-    filesystem::create_directories(filesystem::path(prefix).parent_path());
-
-    vector<vector<pair<int, int>>> adjacency(numberOfNodes);
-
-    for (const auto& entry : edgeMembership) {
-        int u = entry.first.first;
-        int v = entry.first.second;
-        int m = entry.second;
-        if (m < 1) m = 1;
-        if (m > K) m = K;
-        int w = K + 1 - m;
-        adjacency[u].push_back({v, w});
-    }
-
-    ofstream rowFile(prefix + "RowPtr.txt");
-    ofstream colFile(prefix + "ColInd.txt");
-    ofstream valFile(prefix + "Values.txt");
-
-    if (!rowFile.is_open() || !colFile.is_open() || !valFile.is_open()) {
-        return false;
-    }
-
-    int edgeCount = 0;
-    rowFile << 0 << "\n";
-    for (int u = 0; u < numberOfNodes; ++u) {
-        edgeCount += static_cast<int>(adjacency[u].size());
-        rowFile << edgeCount << "\n";
-    }
-
-    for (int u = 0; u < numberOfNodes; ++u) {
-        for (const auto& edge : adjacency[u]) {
-            colFile << edge.first << "\n";
-            valFile << edge.second << "\n";
+    for (const auto& e : edges) {
+        int u = std::get<0>(e);                            // tail
+        int v = std::get<1>(e);                            // head
+        int w = std::get<2>(e);                            // combined weight
+        if (u >= 0 && u < numVertices && v >= 0 && v < numVertices) {
+            adj[u].push_back({v, w});                      // save edge
         }
     }
 
-    return true;
-}
+    std::ofstream rowPtrFile(prefix + "RowPtr.txt");       // repo-style CSR rowPtr
+    std::ofstream colIndFile(prefix + "ColInd.txt");       // repo-style CSR colInd
+    std::ofstream valuesFile(prefix + "Values.txt");       // repo-style CSR values
 
-bool prepareGraphs(const string& prefix,
-                   int objectiveIndex,
-                   HostCsrGraph& outgoingCSR,
-                   HostCsrGraph& incomingCSR,
-                   DeviceCsrGraph& deviceIncomingCSR) {
-    Graph graph;
-    int numberOfObjectives = 0;
-
-    if (!readCSR(prefix, graph, numberOfObjectives)) {
+    if (!rowPtrFile.is_open() || !colIndFile.is_open() || !valuesFile.is_open()) {
+        std::cerr << "Error: failed to write combined CSR files.\n";
         return false;
     }
 
-    if (objectiveIndex < 0 || objectiveIndex >= numberOfObjectives) {
-        return false;
-    }
+    int edgeCounter = 0;                                   // running edge count
+    rowPtrFile << 0 << "\n";                               // first rowPtr
 
-    if (!buildOutgoingCSR(graph, objectiveIndex, outgoingCSR)) {
-        return false;
-    }
-
-    if (!buildIncomingCSR(graph, objectiveIndex, incomingCSR)) {
-        return false;
-    }
-
-    if (!copyHostCsrToDevice(incomingCSR, deviceIncomingCSR)) {
-        return false;
+    for (int u = 0; u < numVertices; ++u) {
+        for (const auto& [v, w] : adj[u]) {
+            colIndFile << v << "\n";                       // destination
+            valuesFile << w << "\n";                       // single-objective weight
+            ++edgeCounter;                                 // count edge
+        }
+        rowPtrFile << edgeCounter << "\n";                 // next rowPtr
     }
 
     return true;
@@ -162,102 +87,105 @@ bool prepareGraphs(const string& prefix,
 
 } // namespace
 
-bool cudaCombinedGraph(const string& originalCsrPrefix,
-                       const vector<string>& treeInputPaths,
-                       int K,
-                       int source,
-                       const string& workDir,
-                       const string& distancesOutputPath,
-                       const string& treeOutputPath) {
-    if (K <= 0 || static_cast<int>(treeInputPaths.size()) < K) {
-        cout << "Error: invalid K or insufficient tree files.\n";
+bool cudaCombinedGraph(const std::string& originalCsrPrefix,
+                       const std::vector<std::string>& objTreePaths,
+                       int numberOfObjectives,
+                       int sourceVertex,
+                       const std::string& combinedGraphDir,
+                       const std::string& distancesOutputPath,
+                       const std::string& treeOutputPath) {
+    Graph originalGraph;                                   // original graph
+    int originalObjectives = 0;                            // old objective count
+
+    if (!readCSR(originalCsrPrefix, originalGraph, originalObjectives)) {
+        std::cerr << "Error: failed to read original CSR graph.\n";
         return false;
     }
 
-    Graph baseGraph;
-    int numberOfObjectives = 0;
-    if (!readCSR(originalCsrPrefix, baseGraph, numberOfObjectives)) {
-        cout << "Error: could not read original CSR graph.\n";
+    int numVertices = static_cast<int>(originalGraph.size()); // vertex count
+    if (numVertices == 0) {
+        std::cerr << "Error: original graph is empty.\n";
         return false;
     }
 
-    int numberOfNodes = static_cast<int>(baseGraph.size());
-    baseGraph.clear();
+    std::unordered_map<std::pair<int, int>, int, PairHash> edgeFrequency; // edge counts
 
-    if (numberOfNodes == 0) {
-        cout << "Error: graph has no vertices.\n";
-        return false;
-    }
-
-    if (source < 0 || source >= numberOfNodes) {
-        cout << "Error: source out of range.\n";
-        return false;
-    }
-
-    vector<vector<int>> parents(K);
-    for (int k = 0; k < K; ++k) {
-        if (!readParentFile(treeInputPaths[k], parents[k], numberOfNodes)) {
+    for (const std::string& treePath : objTreePaths) {
+        std::vector<int> parents;                          // one objective tree
+        if (!readParentFile(treePath, parents)) {
             return false;
         }
-    }
 
-    map<pair<int, int>, int> edgeMembership;
-    for (int k = 0; k < K; ++k) {
-        for (int v = 0; v < numberOfNodes; ++v) {
-            if (v == source) continue;
-            int u = parents[k][v];
-            if (u < 0 || u >= numberOfNodes) continue;
-            edgeMembership[{u, v}] += 1;
+        for (int v = 0; v < static_cast<int>(parents.size()); ++v) {
+            int p = parents[v];                            // parent of v
+            if (p >= 0) {
+                edgeFrequency[{p, v}]++;                   // count tree usage
+            }
         }
     }
 
-    filesystem::create_directories(workDir);
-    string combinedPrefix = workDir + "/combinedGraphCsr";
+    std::vector<std::tuple<int, int, int>> combinedEdges; // (u,v,w)
+    combinedEdges.reserve(edgeFrequency.size());           // reserve once
 
-    if (!writeCombinedCSR(combinedPrefix, numberOfNodes, edgeMembership, K)) {
-        cout << "Error: failed to write combined CSR.\n";
+    for (const auto& entry : edgeFrequency) {
+        int u = entry.first.first;                         // tail
+        int v = entry.first.second;                        // head
+        int freq = entry.second;                           // number of trees
+        int weight = numberOfObjectives + 1 - freq;       // OpenMP-style weight
+        combinedEdges.push_back({u, v, weight});          // save edge
+    }
+        if (combinedEdges.empty()) {                           // no edges in combined graph
+        std::filesystem::create_directories(combinedGraphDir);
+
+        std::ofstream distOut(distancesOutputPath);        // write trivial distances
+        std::ofstream treeOut(treeOutputPath);             // write trivial parents
+
+        if (!distOut.is_open() || !treeOut.is_open()) {
+            std::cerr << "Error: failed to write empty combined-graph outputs.\n";
+            return false;
+        }
+
+        for (int v = 0; v < numVertices; ++v) {
+            if (v == sourceVertex) distOut << v << " 0\n"; // source distance
+            else distOut << v << " INF\n";                 // unreachable
+
+            if (v == sourceVertex) treeOut << v << " -1\n"; // source parent
+            else treeOut << v << " -1\n";                   // no parent
+        }
+
+        std::cout << "cudaCombinedGraph completed.\n";
+        std::cout << "Distances: " << distancesOutputPath << "\n";
+        std::cout << "Parents:   " << treeOutputPath << "\n";
+        return true;
+    }
+
+    std::string combinedPrefix = combinedGraphDir + "/combinedGraphCsr"; // CSR prefix
+
+    if (!writeCombinedGraphCSR(combinedPrefix, numVertices, combinedEdges)) {
         return false;
     }
 
-    HostCsrGraph outgoingCSR;
-    HostCsrGraph incomingCSR;
-    DeviceCsrGraph deviceIncomingCSR;
+    std::filesystem::path distOutPath(distancesOutputPath); // output dist path
+    if (!distOutPath.parent_path().empty()) {
+        std::filesystem::create_directories(distOutPath.parent_path()); // make dir
+    }
 
-    if (!prepareGraphs(combinedPrefix, 0, outgoingCSR, incomingCSR, deviceIncomingCSR)) {
-        cout << "Error: failed to prepare combined graph for CUDA.\n";
+    std::filesystem::path treeOutPath(treeOutputPath);      // output tree path
+    if (!treeOutPath.parent_path().empty()) {
+        std::filesystem::create_directories(treeOutPath.parent_path()); // make dir
+    }
+
+    if (!runDijkstraCSR(combinedPrefix,                     // solve combined graph
+                        0,                                  // single objective
+                        sourceVertex,
+                        distancesOutputPath,
+                        treeOutputPath)) {
+        std::cerr << "Error: runDijkstraCSR failed on combined graph.\n";
         return false;
     }
 
-    vector<int> finalDistances;
-    vector<int> finalParents;
-
-    bool ok = runHybridSOSPUpdate(outgoingCSR,
-                                  incomingCSR,
-                                  deviceIncomingCSR,
-                                  source,
-                                  finalDistances,
-                                  finalParents);
-
-    freeDeviceCsr(deviceIncomingCSR);
-
-    if (!ok) {
-        cout << "Error: CUDA SOSP solve failed on combined graph.\n";
-        return false;
-    }
-
-    if (!writeVectorToFile(distancesOutputPath, finalDistances)) {
-        cout << "Error: failed to write combined distances.\n";
-        return false;
-    }
-
-    if (!writeParentsToFile(treeOutputPath, finalParents)) {
-        cout << "Error: failed to write combined parents.\n";
-        return false;
-    }
-
-    cout << "cudaCombinedGraph completed.\n";
-    cout << "Distances: " << distancesOutputPath << "\n";
-    cout << "Parents:   " << treeOutputPath << "\n";
-
+    std::cout << "cudaCombinedGraph completed.\n";
+    std::cout << "Distances: " << distancesOutputPath << "\n";
+    std::cout << "Parents:   " << treeOutputPath << "\n";
     return true;
 }

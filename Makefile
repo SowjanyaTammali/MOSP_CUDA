@@ -8,17 +8,17 @@ NVCCFLAGS = -std=c++17 -Iheaders
 LDFLAGS = -lstdc++fs
 
 # Executables
-MAIN_TARGET = bin/mosp_cuda
+MAIN_TARGET = bin/main
 STRESS_TARGET = bin/cuda_stress_test
 
 # Main executable objects
-MAIN_CPP_OBJECTS = build/main.o build/read.o build/updateGraphCSR.o build/sequentialSOSPUpdate.o build/Dijkstra.o build/generateGraphCSR.o build/generateChangedEdges.o
-MAIN_CU_OBJECTS = build/cuda_graph.o build/cuda_kernels.o build/cuda_sosp_update.o build/cudaCombinedGraph.o build/cudaMOSPWorkflow.o
+MAIN_CPP_OBJECTS = build/main.o build/read.o build/updateGraphCSR.o build/sequentialSOSPUpdate.o build/dijkstra.o build/generateGraphCSR.o build/generateChangedEdges.o
+MAIN_CU_OBJECTS = build/cuda_graph.o build/cuda_kernels.o build/cudaParallelSOSPUpdate.o build/cudaCombinedGraph.o 
 MAIN_OBJECTS = $(MAIN_CPP_OBJECTS) $(MAIN_CU_OBJECTS)
 
 # Stress executable objects
-STRESS_CPP_OBJECTS = build/cudaStressTest.o build/read.o build/updateGraphCSR.o build/sequentialSOSPUpdate.o build/Dijkstra.o build/generateGraphCSR.o build/generateChangedEdges.o
-STRESS_CU_OBJECTS = build/cuda_graph.o build/cuda_kernels.o build/cuda_sosp_update.o
+STRESS_CPP_OBJECTS = build/cudaStressTest.o build/read.o build/updateGraphCSR.o build/sequentialSOSPUpdate.o build/dijkstra.o build/generateGraphCSR.o build/generateChangedEdges.o
+STRESS_CU_OBJECTS = build/cuda_graph.o build/cuda_kernels.o build/cudaParallelSOSPUpdate.o build/cudaCombinedGraph.o
 STRESS_OBJECTS = $(STRESS_CPP_OBJECTS) $(STRESS_CU_OBJECTS)
 
 # Default target
@@ -33,11 +33,11 @@ $(STRESS_TARGET): $(STRESS_OBJECTS)
 	$(NVCC) $(STRESS_OBJECTS) -o $(STRESS_TARGET) $(LDFLAGS)
 
 # Compile main driver
-build/main.o: src/main.cpp headers/read.h headers/cuda_graph.cuh headers/cuda_sosp_update.cuh headers/updateGraphCSR.h headers/sequentialSOSPUpdate.h headers/cudaCombinedGraph.cuh headers/cudaMOSPWorkflow.cuh headers/dijkstra.h headers/generateGraphCSR.h headers/generateChangedEdges.h
+build/main.o: src/main.cpp headers/read.h headers/cuda_graph.cuh headers/cudaParallelSOSPUpdate.cuh headers/updateGraphCSR.h headers/sequentialSOSPUpdate.h headers/cudaCombinedGraph.cuh headers/dijkstra.h headers/generateGraphCSR.h headers/generateChangedEdges.h
 	$(CXX) $(CXXFLAGS) -c src/main.cpp -o build/main.o
 
 # Compile stress test driver
-build/cudaStressTest.o: src/cudaStressTest.cpp headers/dijkstra.h headers/generateChangedEdges.h headers/generateGraphCSR.h headers/read.h headers/cuda_graph.cuh headers/cuda_sosp_update.cuh headers/updateGraphCSR.h
+build/cudaStressTest.o: src/cudaStressTest.cpp headers/dijkstra.h headers/generateChangedEdges.h headers/generateGraphCSR.h headers/read.h headers/cuda_graph.cuh headers/cudaParallelSOSPUpdate.cuh headers/cudaCombinedGraph.cuh headers/updateGraphCSR.h
 	$(CXX) $(CXXFLAGS) -c src/cudaStressTest.cpp -o build/cudaStressTest.o
 
 # Common C++ files
@@ -50,8 +50,8 @@ build/updateGraphCSR.o: src/updateGraphCSR.cpp headers/updateGraphCSR.h headers/
 build/sequentialSOSPUpdate.o: src/sequentialSOSPUpdate.cpp headers/sequentialSOSPUpdate.h headers/read.h
 	$(CXX) $(CXXFLAGS) -c src/sequentialSOSPUpdate.cpp -o build/sequentialSOSPUpdate.o
 
-build/Dijkstra.o: src/Dijkstra.cpp headers/dijkstra.h headers/read.h
-	$(CXX) $(CXXFLAGS) -c src/Dijkstra.cpp -o build/Dijkstra.o
+build/dijkstra.o: src/dijkstra.cpp headers/dijkstra.h headers/read.h
+	$(CXX) $(CXXFLAGS) -c src/dijkstra.cpp -o build/dijkstra.o
 
 build/generateGraphCSR.o: src/generateGraphCSR.cpp headers/generateGraphCSR.h
 	$(CXX) $(CXXFLAGS) -c src/generateGraphCSR.cpp -o build/generateGraphCSR.o
@@ -66,14 +66,16 @@ build/cuda_graph.o: src/cuda_graph.cu headers/cuda_graph.cuh headers/read.h
 build/cuda_kernels.o: src/cuda_kernels.cu headers/cuda_kernels.cuh headers/cuda_graph.cuh
 	$(NVCC) $(NVCCFLAGS) -c src/cuda_kernels.cu -o build/cuda_kernels.o
 
-build/cuda_sosp_update.o: src/cuda_sosp_update.cu headers/cuda_sosp_update.cuh headers/cuda_kernels.cuh headers/cuda_graph.cuh
-	$(NVCC) $(NVCCFLAGS) -c src/cuda_sosp_update.cu -o build/cuda_sosp_update.o
+build/cudaParallelSOSPUpdate.o: src/cudaParallelSOSPUpdate.cu headers/cudaParallelSOSPUpdate.cuh headers/cuda_kernels.cuh headers/cuda_graph.cuh headers/read.h headers/updateGraphCSR.h
+	$(NVCC) $(NVCCFLAGS) -c src/cudaParallelSOSPUpdate.cu -o build/cudaParallelSOSPUpdate.o
 
-build/cudaCombinedGraph.o: src/cudaCombinedGraph.cu headers/cudaCombinedGraph.cuh headers/read.h headers/cuda_graph.cuh headers/cuda_sosp_update.cuh
+build/cudaCombinedGraph.o: src/cudaCombinedGraph.cu headers/cudaCombinedGraph.cuh headers/read.h headers/cuda_graph.cuh headers/cudaParallelSOSPUpdate.cuh
 	$(NVCC) $(NVCCFLAGS) -c src/cudaCombinedGraph.cu -o build/cudaCombinedGraph.o
 
-build/cudaMOSPWorkflow.o: src/cudaMOSPWorkflow.cu headers/cudaMOSPWorkflow.cuh headers/read.h headers/cuda_graph.cuh headers/cuda_sosp_update.cuh headers/cudaCombinedGraph.cuh headers/updateGraphCSR.h
-	$(NVCC) $(NVCCFLAGS) -c src/cudaMOSPWorkflow.cu -o build/cudaMOSPWorkflow.o
+
+
+run: $(MAIN_TARGET)
+	./$(MAIN_TARGET)
 
 # Clean
 clean:

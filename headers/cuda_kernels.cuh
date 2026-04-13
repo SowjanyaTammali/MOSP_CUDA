@@ -4,44 +4,15 @@
 #include "cuda_graph.cuh"
 #include <vector>
 
-/**
- * @file cuda_kernels.cuh
- * @brief Declares CUDA kernel helper functions for CSR graphs.
- */
+bool computeOutDegreesOnDevice(const DeviceCsrGraph& deviceGraph,
+                               std::vector<int>& degrees);
 
-/**
- * @brief Computes out-degrees of all vertices on the GPU.
- * @param deviceGraph Input CSR graph stored on the GPU.
- * @param degrees Output vector on the CPU containing one out-degree per vertex.
- * @return true if successful, false otherwise.
- */
-bool computeOutDegreesOnDevice(const DeviceCsrGraph& deviceGraph, std::vector<int>& degrees);
-
-/**
- * @brief Recomputes best parent and best distance for every vertex using incoming CSR.
- * @param incomingGraph Input incoming CSR graph stored on the GPU.
- * @param currentDistances Input distance array on the CPU.
- * @param sourceVertex Source vertex whose distance remains zero.
- * @param newDistances Output distance array on the CPU.
- * @param newParents Output parent array on the CPU.
- * @return true if successful, false otherwise.
- */
 bool recomputeBestParentsOnDevice(const DeviceCsrGraph& incomingGraph,
                                   const std::vector<int>& currentDistances,
                                   int sourceVertex,
                                   std::vector<int>& newDistances,
                                   std::vector<int>& newParents);
 
-/**
- * @brief Recomputes best parent and best distance only for candidate vertices.
- * @param incomingGraph Input incoming CSR graph stored on the GPU.
- * @param currentDistances Input distance array on the CPU.
- * @param candidateVertices List of vertices to recompute.
- * @param sourceVertex Source vertex whose distance remains zero.
- * @param newDistances Output distance array on the CPU.
- * @param newParents Output parent array on the CPU.
- * @return true if successful, false otherwise.
- */
 bool recomputeCandidatesOnDevice(const DeviceCsrGraph& incomingGraph,
                                  const std::vector<int>& currentDistances,
                                  const std::vector<int>& candidateVertices,
@@ -49,17 +20,46 @@ bool recomputeCandidatesOnDevice(const DeviceCsrGraph& incomingGraph,
                                  std::vector<int>& newDistances,
                                  std::vector<int>& newParents);
 
-/**
- * @brief Detects which candidate vertices changed distance on the GPU.
- * @param oldDistances Previous distance array on the CPU.
- * @param newDistances New distance array on the CPU.
- * @param candidateVertices Candidate vertices to inspect.
- * @param changedVertices Output changed vertices on the CPU.
- * @return true if successful, false otherwise.
- */
 bool detectChangedCandidatesOnDevice(const std::vector<int>& oldDistances,
                                      const std::vector<int>& newDistances,
                                      const std::vector<int>& candidateVertices,
                                      std::vector<int>& changedVertices);
+
+bool buildInitialCandidatesOnDevice(int numVertices,
+                                    const std::vector<int>& insertU,
+                                    const std::vector<int>& insertV,
+                                    const std::vector<int>& deleteU,
+                                    const std::vector<int>& deleteV,
+                                    std::vector<int>& initialCandidates);
+
+bool buildNextCandidatesOnDevice(const DeviceCsrGraph& outgoingGraph,
+                                 const std::vector<int>& changedVertices,
+                                 std::vector<int>& nextCandidates);
+
+bool invalidateDeletedTreeSubtreesOnDevice(const std::vector<int>& initialParents,
+                                           const std::vector<int>& deleteU,
+                                           const std::vector<int>& deleteV,
+                                           int sourceVertex,
+                                           std::vector<int>& invalidFlags);
+
+bool runFrontierUpdateLoopOnDevice(const DeviceCsrGraph& outgoingGraph,
+                                   const DeviceCsrGraph& incomingGraph,
+                                   const std::vector<int>& initialDistances,
+                                   const std::vector<int>& initialParents,
+                                   const std::vector<int>& initialCandidates,
+                                   int sourceVertex,
+                                   std::vector<int>& finalDistances,
+                                   std::vector<int>& finalParents);
+
+bool runIncrementalFrontierUpdateLoopOnDevice(const DeviceCsrGraph& outgoingGraph,
+                                              const DeviceCsrGraph& incomingGraph,
+                                              const std::vector<int>& initialDistances,
+                                              const std::vector<int>& initialParents,
+                                              const std::vector<int>& initialCandidates,
+                                              const std::vector<int>& deleteU,
+                                              const std::vector<int>& deleteV,
+                                              int sourceVertex,
+                                              std::vector<int>& finalDistances,
+                                              std::vector<int>& finalParents);
 
 #endif

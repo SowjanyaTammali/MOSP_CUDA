@@ -1,0 +1,8 @@
+build/
+bin/
+output/
+cudaStressTest/
+tests/testCase*/
+data/originalGraph/*.txt
+data/updatedGraph/*.txt
+*.o
