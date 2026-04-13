@@ -5,4 +5,5 @@ cudaStressTest/
 tests/testCase*/
 data/originalGraph/*.txt
 data/updatedGraph/*.txt
+data/changes/*.txt
 *.o
